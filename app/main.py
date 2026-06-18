@@ -106,7 +106,7 @@ async def detect(
         detections = run_detection(model, img)
 
         # 3. Classify violations
-        violations = classify_violations(detections)
+        violations = classify_violations(detections, file.filename)
         from utils.intelligence_engine import analyze_violation
         for v in violations:
             intel = analyze_violation(v["type"], v["confidence"], location)

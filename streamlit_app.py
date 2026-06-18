@@ -265,19 +265,26 @@ with tab1:
                 st.markdown("---")
                 st.markdown("### 📄 Generate Challan")
 
-                vio_options = {
-                    v["type"]: VIOLATION_REFERENCE.get(v["type"],{}).get("display_name", v["type"])
-                    for v in violations
+                # Allow selecting from ALL supported violations to support manual override
+                all_vios = {
+                    k: v["display_name"] for k, v in VIOLATION_REFERENCE.items()
                 }
+                default_vtype = violations[0]["type"] if violations else "helmet_violation"
                 selected_vtype = st.selectbox(
                     "Select violation for challan:",
-                    options=list(vio_options.keys()),
-                    format_func=lambda x: vio_options[x],
+                    options=list(all_vios.keys()),
+                    index=list(all_vios.keys()).index(default_vtype),
+                    format_func=lambda x: all_vios[x],
                 )
                 st.session_state.selected_violation = selected_vtype
 
                 if st.button("⚡ Generate Bilingual Challan PDF", use_container_width=True):
-                    selected_v = next((v for v in violations if v["type"] == selected_vtype), violations[0])
+                    selected_v = next((v for v in violations if v["type"] == selected_vtype), None)
+                    if not selected_v:
+                        from utils.intelligence_engine import analyze_violation
+                        selected_v = analyze_violation(selected_vtype, 0.95, location)
+                        selected_v["confidence"] = 0.95
+                        selected_v["type"] = selected_vtype
                     with st.spinner("Generating challan with Groq LLM..."):
                         challan = call_challan(
                             plate      = plate_info.get("plate_number","DL 01 AB 1234"),
