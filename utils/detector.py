@@ -7,6 +7,10 @@ import time
 import base64
 import logging
 import numpy as np
+import pkg_resources
+for pkg in pkg_resources.working_set:
+    if "opencv" in pkg.project_name.lower():
+        print("OPENCV PACKAGE:", pkg.project_name, pkg.version)
 import cv2
 from PIL import Image
 
