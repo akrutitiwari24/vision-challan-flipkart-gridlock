@@ -371,8 +371,12 @@ def render_detection_tab():
                     try:
                         result = call_detect_api(file_bytes, st.session_state.location_input)
                         st.session_state.detection_result = result
-                    except Exception:
-                        show_error("Could not reach detection API.", "Ensure backend is running and reachable.")
+                    except Exception as e:
+                        st.error(str(e))
+                        show_error(
+                            "Could not reach detection API.",
+                            str(e)
+                        )
         else:
             st.markdown('<div class="panel" style="min-height:320px;display:flex;align-items:center;justify-content:center;">'
                         '<div style="text-align:center;color:#94a3b8;line-height:1.8;">Upload an image to see detections, bounding boxes, and confidence values in this area.</div>'
