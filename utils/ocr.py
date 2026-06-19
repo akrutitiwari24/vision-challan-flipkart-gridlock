@@ -54,6 +54,27 @@ def extract_plate_region(img: np.ndarray, bbox: list = None) -> np.ndarray:
     return region
 
 
+def preprocess_for_ocr(image_np: np.ndarray) -> np.ndarray:
+    """Enhance full image for license plate OCR."""
+    if image_np is None or image_np.size == 0:
+        return image_np
+
+    h, w = image_np.shape[:2]
+    if w < 800:
+        scale = 800 / w
+        image_np = cv2.resize(image_np, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    blur = cv2.GaussianBlur(image_np, (0, 0), 3)
+    sharpened = cv2.addWeighted(image_np, 1.5, blur, -0.5, 0)
+
+    lab = cv2.cvtColor(sharpened, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    enhanced = cv2.merge([l, a, b])
+    return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+
 def preprocess_plate(plate_img: np.ndarray) -> np.ndarray:
     """Enhance plate image for better OCR accuracy."""
     if plate_img is None or plate_img.size == 0:
@@ -71,6 +92,30 @@ def preprocess_plate(plate_img: np.ndarray) -> np.ndarray:
     blur  = cv2.GaussianBlur(gray, (3, 3), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return thresh
+
+
+def is_valid_plate(text: str) -> bool:
+    """Reject implausible OCR readings (watermarks, logos, too-short text)."""
+    clean = text.replace(" ", "").replace("-", "").upper()
+
+    if len(clean) < 4:
+        return False
+
+    if clean.isalpha() and len(clean) < 6:
+        return False
+
+    reject_words = {
+        "CC", "TM", "LTD", "PVT", "WWW", "COM", "ORG",
+        "COPYRIGHT", "COPY", "BAJAJ", "HONDA", "HERO", "TVS",
+        "SHUTTERSTOCK", "DREAMSTIME", "ALLIANZ",
+    }
+    if clean in reject_words:
+        return False
+
+    if not any(c.isdigit() for c in clean):
+        return False
+
+    return True
 
 
 def clean_plate_text(raw_text: str) -> str:
@@ -107,7 +152,8 @@ def read_plate(img: np.ndarray, bbox: list = None) -> dict:
     }
 
     try:
-        plate_region = extract_plate_region(img, bbox)
+        img_enhanced = preprocess_for_ocr(img)
+        plate_region = extract_plate_region(img_enhanced, bbox)
         if plate_region is None or plate_region.size == 0:
             return result
 
@@ -124,15 +170,17 @@ def read_plate(img: np.ndarray, bbox: list = None) -> dict:
                 
             # Stage 3: Try scanning the bottom 50% of the entire image
             if not ocr_results:
-                h, w = img.shape[:2]
-                fallback_full_region = img[int(h * 0.5):h, :]
+                h, w = img_enhanced.shape[:2]
+                fallback_full_region = img_enhanced[int(h * 0.5):h, :]
                 ocr_results = reader.readtext(fallback_full_region)
 
             if ocr_results:
-                # --- STRATEGY A: Try parsing individual candidates first ---
                 candidates = sorted(ocr_results, key=lambda x: -x[2])
                 best_match = None
                 for c in candidates:
+                    raw = c[1].strip().upper()
+                    if c[2] <= 0.3 or not is_valid_plate(raw):
+                        continue
                     cleaned = clean_plate_text(c[1])
                     if cleaned != "UNDETECTED" and len(cleaned.replace(" ", "")) >= 7:
                         best_match = (cleaned, c[2])
@@ -187,13 +235,18 @@ def read_plate(img: np.ndarray, bbox: list = None) -> dict:
                     avg_conf = total_conf / count if count > 0 else 0.0
                     
                     cleaned_combined = clean_plate_text(combined_text)
-                    if cleaned_combined != "UNDETECTED":
+                    if cleaned_combined != "UNDETECTED" and is_valid_plate(combined_text):
                         best_match = (cleaned_combined, avg_conf)
                 
-                # --- STRATEGY C: Ultimate fallback to highest confidence candidate text ---
-                if not best_match and candidates:
-                    best = candidates[0]
-                    best_match = (clean_plate_text(best[1]), best[2])
+                # --- STRATEGY C: Ultimate fallback to highest confidence valid candidate ---
+                if not best_match:
+                    for c in candidates:
+                        raw = c[1].strip().upper()
+                        if c[2] > 0.3 and is_valid_plate(raw):
+                            cleaned = clean_plate_text(c[1])
+                            if cleaned != "UNDETECTED":
+                                best_match = (cleaned, c[2])
+                                break
 
                 if best_match:
                     result.update({

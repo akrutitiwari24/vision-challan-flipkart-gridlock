@@ -7,12 +7,20 @@ Endpoints:
   GET  /health     - Health check
 """
 
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def home():
+    return {"status": "VisionChallan API is running 🚀"}
+
 import os
-import json
+import sqlite3
 import base64
 import datetime
 import logging
-from pathlib import Path
+from contextlib import closing
 from typing import Optional
 from collections import defaultdict
 
@@ -39,6 +47,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Font registration check ────────────────────────────────────────────────────
+from utils.pdf_generator import register_fonts, DEVANAGARI_FONT_PATH
+
+fonts_ok = register_fonts()
+if not fonts_ok:
+    print("WARNING: NotoSansDevanagari font not found. Hindi will not render in PDFs.")
+    print(f"Expected at: {DEVANAGARI_FONT_PATH}")
+
 # ── Lazy-load YOLO (avoids OOM on startup) ─────────────────────────────────────
 _model = None
 
@@ -49,8 +65,91 @@ def get_model():
         _model = load_model()
     return _model
 
-# ── In-memory violation log (replace with SQLite for persistence) ──────────────
-violation_log: list[dict] = []
+# ── SQLite violation log (persists across API restarts) ───────────────────────
+DB_PATH = os.getenv("VIOLATIONS_DB_PATH", "violations.db")
+
+
+def init_db():
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS violations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                plate TEXT,
+                violation_type TEXT,
+                confidence REAL,
+                location TEXT,
+                fine_amount INTEGER,
+                severity_score INTEGER,
+                risk_level TEXT,
+                explanation_en TEXT,
+                explanation_hi TEXT,
+                enforcement_priority TEXT
+            )
+        """)
+        conn.commit()
+
+
+def log_violation(data: dict):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("""
+            INSERT INTO violations (
+                timestamp, plate, violation_type, confidence, location, fine_amount,
+                severity_score, risk_level, explanation_en, explanation_hi,
+                enforcement_priority
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.get("timestamp"),
+            data.get("plate") or data.get("plate_number"),
+            data.get("type") or data.get("violation_type"),
+            data.get("confidence"),
+            data.get("location"),
+            data.get("fine_amount", 0),
+            data.get("severity_score", 50),
+            data.get("risk_level", "Medium"),
+            data.get("explanation_en", ""),
+            data.get("explanation_hi", ""),
+            data.get("enforcement_priority", "Routine Monitoring"),
+        ))
+        conn.commit()
+
+
+def get_all_violations() -> list[dict]:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM violations ORDER BY id ASC"
+        ).fetchall()
+    return [
+        {
+            "type":                 r["violation_type"],
+            "confidence":           r["confidence"],
+            "plate":                r["plate"],
+            "location":             r["location"],
+            "timestamp":            r["timestamp"],
+            "severity_score":       r["severity_score"],
+            "risk_level":           r["risk_level"],
+            "explanation_en":       r["explanation_en"],
+            "explanation_hi":       r["explanation_hi"],
+            "enforcement_priority": r["enforcement_priority"],
+        }
+        for r in rows
+    ]
+
+
+def clear_violations():
+    """Clear all logged violations (used by tests)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("DELETE FROM violations")
+        conn.commit()
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+
+init_db()
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
 class ChallanRequest(BaseModel):
@@ -90,14 +189,49 @@ async def detect(
         raise HTTPException(400, "Image too large (max 15 MB).")
 
     try:
+        from PIL import Image as PILImage
+        import io as _io
         from utils.detector import (
-            preprocess_image, run_detection,
+            preprocess_image, run_detection, detect_image_authenticity,
             classify_violations, annotate_image, image_to_base64
         )
         from utils.ocr import read_plate
 
-        # 1. Preprocess
+        # Normalize all image formats to JPEG bytes before processing
+        pil_img = PILImage.open(_io.BytesIO(image_bytes))
+        if pil_img.mode in ("RGBA", "P", "LA"):
+            background = PILImage.new("RGB", pil_img.size, (255, 255, 255))
+            if pil_img.mode == "P":
+                pil_img = pil_img.convert("RGBA")
+            mask = pil_img.split()[-1] if pil_img.mode in ("RGBA", "LA") else None
+            background.paste(pil_img, mask=mask)
+            pil_img = background
+        elif pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+
+        normalized = _io.BytesIO()
+        pil_img.save(normalized, format="JPEG", quality=95)
+        image_bytes = normalized.getvalue()
+
+        # 1. Preprocess (BGR for OpenCV)
         img = preprocess_image(image_bytes)
+
+        # 1b. Authenticity check — reject cartoons/illustrations
+        auth_result = detect_image_authenticity(img)
+        if not auth_result["authentic"]:
+            ts = datetime.datetime.now().isoformat()
+            return JSONResponse({
+                "success":              True,
+                "authentic":            False,
+                "authenticity_message": auth_result["message"],
+                "authenticity_reason":  auth_result["reason"],
+                "violations":           [],
+                "plate":                {"plate_number": "N/A", "confidence": 0.0, "method": "none"},
+                "detections_count":     0,
+                "annotated_image":      None,
+                "location":             location,
+                "timestamp":            ts,
+            })
 
         # 2. YOLO detect
         model      = get_model()
@@ -106,7 +240,13 @@ async def detect(
         detections = run_detection(model, img)
 
         # 3. Classify violations
-        violations = classify_violations(detections, file.filename)
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        violations = classify_violations(
+            detections,
+            filename=file.filename,
+            image=img,
+            image_b64=image_b64,
+        )
         from utils.intelligence_engine import analyze_violation
         for v in violations:
             intel = analyze_violation(v["type"], v["confidence"], location)
@@ -123,7 +263,7 @@ async def detect(
         # 6. Log violations
         ts = datetime.datetime.now().isoformat()
         for v in violations:
-            violation_log.append({
+            log_violation({
                 "type":                 v["type"],
                 "confidence":           v["confidence"],
                 "plate":                plate_info["plate_number"],
@@ -138,6 +278,7 @@ async def detect(
 
         return JSONResponse({
             "success":         True,
+            "authentic":       True,
             "violations":      violations,
             "plate":           plate_info,
             "detections_count": len(detections),
@@ -186,6 +327,22 @@ async def generate_challan(req: ChallanRequest):
 
         challan_data.update(intel)
 
+        from utils.mv_act_reference import get_violation_info
+        mv_info = get_violation_info(req.violation_type)
+        log_violation({
+            "plate_number":         req.plate_number,
+            "violation_type":       req.violation_type,
+            "confidence":           req.confidence,
+            "location":             req.location,
+            "timestamp":            req.timestamp or datetime.datetime.now().isoformat(),
+            "fine_amount":          challan_data.get("fine_amount_inr", mv_info["fine_inr"]),
+            "severity_score":       challan_data.get("severity_score", 50),
+            "risk_level":           challan_data.get("risk_level", "Medium"),
+            "explanation_en":       challan_data.get("explanation_en", ""),
+            "explanation_hi":       challan_data.get("explanation_hi", ""),
+            "enforcement_priority": challan_data.get("enforcement_priority", "Routine Monitoring"),
+        })
+
         pdf_bytes = generate_challan_pdf(
             challan_data = challan_data,
             evidence_b64 = req.evidence_b64,
@@ -209,6 +366,7 @@ async def generate_challan(req: ChallanRequest):
 @app.get("/analytics")
 def analytics():
     """Return aggregated violation statistics."""
+    violation_log = get_all_violations()
     if not violation_log:
         return {
             "total_violations": 0,

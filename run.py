@@ -29,8 +29,25 @@ def get_python_executable():
     return sys.executable
 
 
+def wait_for_api(url="http://localhost:8000/health", timeout=30):
+    print("  Waiting for API to be ready...", end="", flush=True)
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            import requests
+            r = requests.get(url, timeout=1)
+            if r.status_code == 200:
+                print(" ✓")
+                return True
+        except Exception:
+            pass
+        print(".", end="", flush=True)
+        time.sleep(0.5)
+    print(" ✗ (timeout)")
+    return False
+
+
 def start_api():
-    print("[INFO] Starting FastAPI backend on http://localhost:8000 ...")
     env = os.environ.copy()
     env["PYTHONPATH"] = ROOT
     py_exec = get_python_executable()
@@ -42,7 +59,6 @@ def start_api():
 
 
 def start_ui():
-    print("[INFO] Starting Streamlit UI on http://localhost:8501 ...")
     env = os.environ.copy()
     env["PYTHONPATH"] = ROOT
     py_exec = get_python_executable()
@@ -61,25 +77,28 @@ def main():
     parser.add_argument("--ui-only",  action="store_true")
     args = parser.parse_args()
 
-    # Load .env if present
     env_file = os.path.join(ROOT, ".env")
     if os.path.exists(env_file):
         from dotenv import load_dotenv
         load_dotenv(env_file)
-        print("[SUCCESS] Loaded .env configuration")
-    else:
-        print("[WARNING] No .env file found. Copy .env.example to .env and add your GROQ_API_KEY.")
+
+    print("━" * 50)
+    print("  VisionChallan AI — Starting up")
+    print("━" * 50)
+    print("  API:  http://localhost:8000")
+    print("  UI:   http://localhost:8501")
+    print("  Docs: http://localhost:8000/docs")
+    print("━" * 50)
 
     if args.api_only:
         start_api()
     elif args.ui_only:
         start_ui()
     else:
-        # Run both concurrently
         api_thread = threading.Thread(target=start_api, daemon=True)
         api_thread.start()
-        time.sleep(2)   # give API a moment to bind
-        start_ui()      # blocks (Streamlit runs in main thread)
+        wait_for_api()
+        start_ui()
 
 
 if __name__ == "__main__":

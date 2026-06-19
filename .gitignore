@@ -15,6 +15,7 @@ venv/
 .venv/
 env/
 ENV/
+.env.example
 
 # Environment / secrets
 .env
@@ -28,6 +29,7 @@ ENV/
 outputs/
 challans/
 annotated/
+violations.db
 
 # Logs
 *.log

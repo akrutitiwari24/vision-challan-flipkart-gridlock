@@ -127,8 +127,8 @@ def test_health_endpoint():
 
 def test_analytics_endpoint_empty():
     from fastapi.testclient import TestClient
-    from app.main import app, violation_log
-    violation_log.clear()
+    from app.main import app, clear_violations
+    clear_violations()
     client = TestClient(app)
     resp = client.get("/analytics")
     assert resp.status_code == 200
@@ -186,12 +186,11 @@ def test_challan_endpoint_with_safety_metrics():
 
 def test_analytics_with_mock_logged_violations():
     from fastapi.testclient import TestClient
-    from app.main import app, violation_log
+    from app.main import app, clear_violations, log_violation
     client = TestClient(app)
-    
-    # Mock some data in the violation log
-    violation_log.clear()
-    violation_log.append({
+
+    clear_violations()
+    log_violation({
         "type": "helmet_violation",
         "confidence": 0.85,
         "plate": "DL 01 AB 1234",
@@ -215,17 +214,17 @@ def test_analytics_with_mock_logged_violations():
 
 def test_triple_riding_person_clustering_fallback():
     from utils.detector import classify_violations
-    # Mock YOLO detections: 3 persons sitting in a line, no motorcycle detected
+    # Mock YOLO detections: motorcycle + 3 persons near/overlapping it
     detections = [
+        {"class_id": 3, "class_name": "motorcycle", "confidence": 0.92, "bbox": [80, 250, 230, 400]},
         {"class_id": 0, "class_name": "person", "confidence": 0.9, "bbox": [100, 200, 150, 350]},
         {"class_id": 0, "class_name": "person", "confidence": 0.85, "bbox": [130, 205, 180, 355]},
         {"class_id": 0, "class_name": "person", "confidence": 0.88, "bbox": [160, 202, 210, 352]},
     ]
-    violations = classify_violations(detections)
+    violations = classify_violations(detections, use_groq=False)
     assert len(violations) == 1
     assert violations[0]["type"] == "triple_riding"
-    # The combined bbox should enclose all 3 persons
-    assert violations[0]["bbox"] == [100, 200, 210, 355]
+    assert violations[0]["bbox"] == [80, 200, 230, 400]
 
 
 def test_seatbelt_violation_and_no_triple_riding_in_car():
@@ -237,7 +236,7 @@ def test_seatbelt_violation_and_no_triple_riding_in_car():
         {"class_id": 0, "class_name": "person", "confidence": 0.88, "bbox": [160, 202, 210, 352]},
         {"class_id": 2, "class_name": "car", "confidence": 0.95, "bbox": [50, 180, 400, 500]},
     ]
-    violations = classify_violations(detections)
-    # Triple riding should be blocked because of car overlap, and seatbelt violation is added
+    violations = classify_violations(detections, use_groq=False)
+    # Triple riding should be blocked (no motorcycle), seatbelt violation when occupant in car
     assert len(violations) == 1
     assert violations[0]["type"] == "no_seatbelt"

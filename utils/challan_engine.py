@@ -19,6 +19,19 @@ Your job is to generate accurate, legally-worded traffic challans under the Moto
 Return ONLY valid JSON. No markdown, no preamble, no explanation. Just the JSON object."""
 
 
+def generate_challan_number(location: str = "Unknown") -> str:
+    """Generate official-style challan reference with city prefix."""
+    city_codes = {
+        "bengaluru": "BLR", "bangalore": "BLR", "delhi": "DL",
+        "new delhi": "DL", "mumbai": "MUM", "chennai": "CHN",
+        "hyderabad": "HYD", "kolkata": "KOL", "pune": "PUN",
+    }
+    city_key = (location or "Unknown").lower().split(",")[0].strip()
+    prefix = city_codes.get(city_key, "VC")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{prefix}-VC-{timestamp}"
+
+
 def _build_challan_prompt(
     plate_number: str,
     violation_type: str,
@@ -106,6 +119,7 @@ def generate_challan_groq(
 
             challan_data = json.loads(raw)
             challan_data["_source"] = "groq_llm"
+            challan_data["challan_id"] = generate_challan_number(location)
             return challan_data
 
         except Exception as e:
@@ -120,7 +134,7 @@ def _template_challan(
     plate_number, violation_type, confidence, timestamp, location, mv_info
 ) -> dict:
     """High-quality template challan — used when Groq is unavailable."""
-    challan_id = f"VC{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+    challan_id = generate_challan_number(location)
     return {
         "challan_id":               challan_id,
         "vehicle_registration":     plate_number,
