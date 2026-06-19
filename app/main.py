@@ -7,14 +7,6 @@ Endpoints:
   GET  /health     - Health check
 """
 
-from fastapi import FastAPI
-
-app = FastAPI()
-
-@app.get("/")
-def home():
-    return {"status": "VisionChallan API is running 🚀"}
-
 import os
 import sqlite3
 import base64
@@ -27,7 +19,14 @@ from collections import defaultdict
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+app = FastAPI()
+
+@app.get("/")
+def home():
+    return {"status": "VisionChallan API is running"}
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +45,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Mount static files for QR verification ─────────────────────────────────────
+static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+os.makedirs(static_dir, exist_ok=True)
+app.mount("/verify", StaticFiles(directory=static_dir, html=True), name="static")
 
 # ── Font registration check ────────────────────────────────────────────────────
 from utils.pdf_generator import register_fonts, DEVANAGARI_FONT_PATH
@@ -156,7 +160,7 @@ class ChallanRequest(BaseModel):
     plate_number:   str
     violation_type: str
     confidence:     float = 0.85
-    location:       str   = "New Delhi, India"
+    location:       str   = "Bengaluru, Karnataka"
     timestamp:      Optional[str] = None
     evidence_b64:   Optional[str] = None
     severity_score: Optional[int] = None
@@ -164,6 +168,7 @@ class ChallanRequest(BaseModel):
     explanation_en: Optional[str] = None
     explanation_hi: Optional[str] = None
     enforcement_priority: Optional[str] = None
+    vehicle_info:   Optional[dict] = None
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
@@ -175,12 +180,11 @@ def health():
 @app.post("/detect")
 async def detect(
     file:     UploadFile = File(...),
-    location: str        = Form("New Delhi, India"),
+    location: str        = Form("Bengaluru, Karnataka"),
 ):
     """
-    Upload an image → get violations, annotated image, and plate OCR.
+    Upload an image → get violations, annotated image, plate OCR, and vehicle info.
     """
-    # Validate file type
     if not file.content_type.startswith("image/"):
         raise HTTPException(400, "Only image files are accepted.")
 
@@ -191,13 +195,9 @@ async def detect(
     try:
         from PIL import Image as PILImage
         import io as _io
-        from utils.detector import (
-            preprocess_image, run_detection, detect_image_authenticity,
-            classify_violations, annotate_image, image_to_base64
-        )
-        from utils.ocr import read_plate
+        from utils.detector import ViolationDetector
 
-        # Normalize all image formats to JPEG bytes before processing
+        # Normalize all image formats to JPEG bytes
         pil_img = PILImage.open(_io.BytesIO(image_bytes))
         if pil_img.mode in ("RGBA", "P", "LA"):
             background = PILImage.new("RGB", pil_img.size, (255, 255, 255))
@@ -213,78 +213,40 @@ async def detect(
         pil_img.save(normalized, format="JPEG", quality=95)
         image_bytes = normalized.getvalue()
 
-        # 1. Preprocess (BGR for OpenCV)
-        img = preprocess_image(image_bytes)
+        # Run detection pipeline
+        detector = ViolationDetector()
+        result = detector.detect(image_bytes, location)
 
-        # 1b. Authenticity check — reject cartoons/illustrations
-        auth_result = detect_image_authenticity(img)
-        if not auth_result["authentic"]:
-            ts = datetime.datetime.now().isoformat()
-            return JSONResponse({
-                "success":              True,
-                "authentic":            False,
-                "authenticity_message": auth_result["message"],
-                "authenticity_reason":  auth_result["reason"],
-                "violations":           [],
-                "plate":                {"plate_number": "N/A", "confidence": 0.0, "method": "none"},
-                "detections_count":     0,
-                "annotated_image":      None,
-                "location":             location,
-                "timestamp":            ts,
-            })
-
-        # 2. YOLO detect
-        model      = get_model()
-        if model is None:
-            raise HTTPException(503, "Detection model not available.")
-        detections = run_detection(model, img)
-
-        # 3. Classify violations
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        violations = classify_violations(
-            detections,
-            filename=file.filename,
-            image=img,
-            image_b64=image_b64,
-        )
-        from utils.intelligence_engine import analyze_violation
-        for v in violations:
-            intel = analyze_violation(v["type"], v["confidence"], location)
-            v.update(intel)
-
-        # 4. OCR on best vehicle bbox (first violation's bbox or full image)
-        bbox_for_ocr = violations[0]["bbox"] if violations else None
-        plate_info   = read_plate(img, bbox_for_ocr)
-
-        # 5. Annotate
-        annotated     = annotate_image(img, detections, violations)
-        annotated_b64 = image_to_base64(annotated)
-
-        # 6. Log violations
         ts = datetime.datetime.now().isoformat()
-        for v in violations:
+
+        # Log violations
+        for v in result.get("violations", []):
             log_violation({
-                "type":                 v["type"],
-                "confidence":           v["confidence"],
-                "plate":                plate_info["plate_number"],
+                "type":                 v.get("type"),
+                "confidence":           v.get("confidence"),
+                "plate":                result.get("plate_number"),
                 "location":             location,
                 "timestamp":            ts,
-                "severity_score":       v.get("severity_score", 50),
-                "risk_level":           v.get("risk_level", "Medium"),
-                "explanation_en":       v.get("explanation_en", ""),
-                "explanation_hi":       v.get("explanation_hi", ""),
-                "enforcement_priority": v.get("enforcement_priority", "Routine Monitoring"),
+                "severity_score":       50,
+                "risk_level":           "Medium",
+                "explanation_en":       "",
+                "explanation_hi":       "",
+                "enforcement_priority": "Routine Monitoring",
             })
 
         return JSONResponse({
-            "success":         True,
-            "authentic":       True,
-            "violations":      violations,
-            "plate":           plate_info,
-            "detections_count": len(detections),
-            "annotated_image": annotated_b64,
-            "location":        location,
-            "timestamp":       ts,
+            "success":           True,
+            "authentic":         result.get("authentic", True),
+            "authenticity_message": result.get("authenticity_message", ""),
+            "authenticity_reason": result.get("authenticity_reason", ""),
+            "violations":        result.get("violations", []),
+            "plate_number":      result.get("plate_number", "UNDETECTED"),
+            "detection_count":   result.get("detection_count", 0),
+            "annotated_image":   result.get("annotated_image"),
+            "vehicle_info":      result.get("vehicle_info", {}),
+            "location":          location,
+            "elapsed_ms":        result.get("elapsed_ms", 0),
+            "timestamp":         ts,
         })
 
     except HTTPException:
@@ -312,6 +274,10 @@ async def generate_challan(req: ChallanRequest):
             location       = req.location,
             timestamp      = req.timestamp,
         )
+
+        # Add vehicle info if provided
+        if req.vehicle_info:
+            challan_data["vehicle_make_model"] = req.vehicle_info.get("make_model", "Unknown Vehicle")
 
         # Merge intelligence assessment data
         if req.severity_score is not None:
@@ -352,15 +318,55 @@ async def generate_challan(req: ChallanRequest):
         pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
         return JSONResponse({
-            "success":      True,
-            "challan":      challan_data,
-            "pdf_b64":      pdf_b64,
-            "pdf_filename": f"challan_{challan_data.get('challan_id','VCA')}.pdf",
+            "success":       True,
+            "challan": {
+                "challan_number": challan_data.get("challan_number", "UNKNOWN"),
+                "plate_number":  req.plate_number,
+                "violation_type": req.violation_type,
+                "fine_amount":   challan_data.get("fine_amount_inr", mv_info["fine_inr"]),
+                "location":      req.location,
+                "mv_act_section": challan_data.get("mv_act_section", ""),
+                "violation_description_en": challan_data.get("explanation_en", ""),
+                "violation_description_hi": challan_data.get("explanation_hi", ""),
+                "severity_score": req.severity_score or challan_data.get("severity_score", 50),
+                "risk_level": req.risk_level or challan_data.get("risk_level", "Medium"),
+                "qr_code":       challan_data.get("qr_code_b64", ""),
+            },
+            "pdf_b64":       pdf_b64,
+            "pdf_filename":  f"challan_{challan_data.get('challan_number','VCA')}.pdf",
         })
 
     except Exception as e:
         logger.error(f"/challan error: {e}", exc_info=True)
         raise HTTPException(500, f"Challan generation failed: {str(e)}")
+
+
+@app.post("/challan/pdf")
+async def challan_pdf(req: ChallanRequest):
+    """Generate PDF directly from challan request."""
+    try:
+        from utils.challan_engine import generate_challan_groq
+        from utils.pdf_generator import generate_challan_pdf
+
+        challan_data = generate_challan_groq(
+            plate_number=req.plate_number,
+            violation_type=req.violation_type,
+            confidence=req.confidence,
+            location=req.location,
+            timestamp=req.timestamp,
+        )
+
+        pdf_bytes = generate_challan_pdf(
+            challan_data=challan_data,
+            evidence_b64=req.evidence_b64,
+            location=req.location,
+        )
+
+        return Response(content=pdf_bytes, media_type="application/pdf")
+
+    except Exception as e:
+        logger.error(f"/challan/pdf error: {e}", exc_info=True)
+        raise HTTPException(500, f"PDF generation failed: {str(e)}")
 
 
 @app.get("/analytics")

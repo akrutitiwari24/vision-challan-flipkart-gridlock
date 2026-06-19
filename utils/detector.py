@@ -1,719 +1,699 @@
 """
-VisionChallan AI - Violation Detector
-Multi-signal detection: YOLOv8n + honest rule engine + optional Groq vision fallback.
+VisionChallan AI — Detection pipeline.
+Combines YOLOv8n + per-signal rule engine + multi-signal violation rules.
 """
-
-import os
-import re
-import cv2
-import numpy as np
+import io
+import time
 import base64
-import datetime
 import logging
+import numpy as np
+import cv2
+from PIL import Image
+
+from utils.authenticity import classify_image_authenticity
+from utils.vehicle_classifier import infer_vehicle
 
 logger = logging.getLogger(__name__)
 
-CONF_THRESHOLD = 0.25
-GROQ_CONF_THRESHOLD = 0.55
-PROXIMITY_PX = 80
-DEFAULT_THRESHOLD = 0.38
-
-CLASS_CONFIDENCE_THRESHOLDS = {
-    "traffic light": 0.25,
-    "person":        0.45,
-    "motorcycle":    0.40,
-    "car":           0.40,
+# ── Per-class confidence thresholds (tuned for traffic scenes) ──
+CLASS_THRESHOLDS = {
+    "traffic light": 0.22,   # undershoots in YOLO — keep lower
+    "stop sign":     0.25,
+    "person":        0.42,
+    "motorcycle":    0.38,
+    "bicycle":       0.38,
+    "car":           0.38,
     "truck":         0.35,
     "bus":           0.35,
-    "stop sign":     0.30,
-    "bicycle":       0.40,
+}
+DEFAULT_THRESHOLD = 0.36
+
+# ── Violation fine map ──
+FINE_MAP = {
+    "triple_riding":       1000,
+    "no_helmet":           1000,
+    "no_seatbelt":         1000,
+    "red_light_violation": 5000,
+    "illegal_parking":     500,
 }
 
-VIOLATION_COLORS = {
-    "helmet_violation":    (0,   0,   220),
-    "triple_riding":       (0,   140, 255),
-    "no_seatbelt":         (0,   80,  200),
-    "red_light_violation": (0,   0,   180),
-    "illegal_parking":     (180, 100, 0),
-    "stop_line_violation": (200, 0,   200),
-}
+class ViolationDetector:
 
-VEHICLE_CLASS_IDS = {2, 3, 5, 7}
-VEHICLE_CLASS_NAMES = {"car", "motorcycle", "bus", "truck"}
-PERSON_CLASS_ID = 0
-TRAFFIC_LIGHT_CLASS_ID = 9
-STOP_SIGN_CLASS_ID = 11
+    def __init__(self):
+        self._model = None
+        self._ocr   = None
 
+    # ────────────────────────────────────────────
+    # Lazy loaders
+    # ────────────────────────────────────────────
+    @property
+    def model(self):
+        if self._model is None:
+            from ultralytics import YOLO
+            self._model = YOLO("yolov8n.pt")
+            logger.info("YOLOv8n loaded")
+        return self._model
 
-def load_model():
-    """Load YOLOv8n — downloads ~6 MB on first run."""
-    try:
-        from ultralytics import YOLO
-        model = YOLO("yolov8n.pt")
-        logger.info("YOLOv8n loaded successfully.")
-        return model
-    except Exception as e:
-        logger.error(f"Failed to load YOLO: {e}")
-        return None
+    @property
+    def ocr(self):
+        if self._ocr is None:
+            import easyocr
+            self._ocr = easyocr.Reader(["en"], gpu=False, verbose=False)
+            logger.info("EasyOCR loaded")
+        return self._ocr
 
+    # ────────────────────────────────────────────
+    # Main entry point
+    # ────────────────────────────────────────────
+    def detect(self, image_bytes: bytes, location: str = "Unknown") -> dict:
+        t0 = time.time()
 
-def preprocess_image(image_bytes: bytes) -> np.ndarray:
-    """Decode bytes → BGR numpy array with CLAHE contrast enhancement."""
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Could not decode image.")
+        # 1. Decode & normalize to BGR numpy
+        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        if pil.width < 200 or pil.height < 200:
+            return self._empty_result(location, "Image too small for detection")
+        
+        rgb = np.array(pil)
+        bgr = rgb[:, :, ::-1].copy()
 
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    img = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-    return img
+        # 2. Authenticity check
+        auth = classify_image_authenticity(bgr)
+        if not auth["authentic"]:
+            return {
+                "violations": [], "plate_number": "N/A",
+                "detection_count": 0, "annotated_image": None,
+                "authentic": False,
+                "authenticity_message": auth["message"],
+                "authenticity_reason":  auth["reason"],
+                "location": location, "elapsed_ms": 0,
+                "vehicle_info": {},
+            }
 
+        # 3. YOLO inference (pass RGB PIL to YOLO — it expects RGB)
+        results = self.model(pil, verbose=False)[0]
+        raw_detections = self._parse_yolo(results)
 
-def filter_detections(raw_detections: list) -> list:
-    """Apply per-class confidence thresholds."""
-    filtered = []
-    for det in raw_detections:
-        cls = det["class_name"]
-        threshold = CLASS_CONFIDENCE_THRESHOLDS.get(cls, DEFAULT_THRESHOLD)
-        if det["confidence"] >= threshold:
-            filtered.append(det)
-    return filtered
+        # 4. Per-class threshold filter
+        detections = self._filter_by_threshold(raw_detections)
 
+        # 5. NMS within each class
+        detections = self._nms(detections, iou_threshold=0.45)
 
-def apply_nms(detections: list, iou_threshold: float = 0.45) -> list:
-    """Remove duplicate detections of the same object."""
-    by_class: dict[str, list] = {}
-    for d in detections:
-        by_class.setdefault(d["class_name"], []).append(d)
+        # 6. Violation rule engine
+        violations = self._run_rules(detections, bgr)
 
-    result = []
-    for dets in by_class.values():
-        if len(dets) == 1:
-            result.extend(dets)
-            continue
+        # 7. OCR — only on original BGR (not annotated)
+        plate = self._read_plate(bgr)
 
-        dets_sorted = sorted(dets, key=lambda x: x["confidence"], reverse=True)
-        kept = []
-        while dets_sorted:
-            best = dets_sorted.pop(0)
-            kept.append(best)
-            remaining = []
-            for d in dets_sorted:
-                b1, b2 = best["bbox"], d["bbox"]
-                ix1 = max(b1[0], b2[0])
-                iy1 = max(b1[1], b2[1])
-                ix2 = min(b1[2], b2[2])
-                iy2 = min(b1[3], b2[3])
-                if ix2 > ix1 and iy2 > iy1:
-                    inter = (ix2 - ix1) * (iy2 - iy1)
-                    a1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
-                    a2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
-                    iou = inter / (a1 + a2 - inter + 1e-6)
-                    if iou > iou_threshold:
-                        continue
-                remaining.append(d)
-            dets_sorted = remaining
-        result.extend(kept)
-    return result
+        # 8. Vehicle inference
+        vehicle_info = infer_vehicle(detections)
 
+        # 9. Annotate image
+        annotated_bgr = self._annotate(bgr.copy(), detections, violations)
+        ann_b64 = self._to_b64(annotated_bgr)
 
-def detect_image_authenticity(image_np: np.ndarray) -> dict:
-    """
-    Classify image as real photograph vs illustration/cartoon/AI art.
-    Returns dict with authentic, confidence, reason, and optional message.
-    """
-    h, w = image_np.shape[:2]
-    flat = image_np.reshape(-1, 3)
-    sample_size = min(10000, len(flat))
-    sample_idx = np.random.choice(len(flat), sample_size, replace=False)
-    sampled = flat[sample_idx]
-    quantized = (sampled // 32).astype(np.uint8)
-    unique_colors = len({tuple(row) for row in quantized})
-    color_diversity_score = min(1.0, unique_colors / 400.0)
+        elapsed = int((time.time() - t0) * 1000)
 
-    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
-    edges_strict = cv2.Canny(gray, 100, 200)
-    edges_loose = cv2.Canny(gray, 30, 100)
-    edge_noise_ratio = cv2.countNonZero(edges_loose) / (cv2.countNonZero(edges_strict) + 1e-6)
-    edge_noise_score = min(1.0, (edge_noise_ratio - 1.0) / 5.0)
+        return {
+            "violations":     violations,
+            "plate_number":   plate,
+            "detection_count": len(detections),
+            "annotated_image": ann_b64,
+            "authentic":       True,
+            "location":        location,
+            "elapsed_ms":      elapsed,
+            "vehicle_info":    vehicle_info,
+        }
 
-    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-    lap_var = laplacian.var()
-    noise_score = min(1.0, lap_var / 500.0)
-
-    channel_diff = np.max(image_np.astype(np.int16), axis=2) - np.min(image_np.astype(np.int16), axis=2)
-    flat_pixel_ratio = float(np.sum(channel_diff < 8)) / (h * w)
-    flat_score = 1.0 - min(1.0, flat_pixel_ratio / 0.4)
-
-    hsv = cv2.cvtColor(image_np, cv2.COLOR_BGR2HSV)
-    sat_std = float(hsv[:, :, 1].std())
-    sat_variance_score = min(1.0, sat_std / 50.0)
-
-    weights = {
-        "color_diversity": 0.30,
-        "edge_noise": 0.25,
-        "noise": 0.20,
-        "flat": 0.15,
-        "sat_variance": 0.10,
-    }
-    real_score = (
-        weights["color_diversity"] * color_diversity_score
-        + weights["edge_noise"] * edge_noise_score
-        + weights["noise"] * noise_score
-        + weights["flat"] * flat_score
-        + weights["sat_variance"] * sat_variance_score
-    )
-
-    if real_score >= 0.52:
-        return {"authentic": True, "confidence": real_score, "reason": "Real photograph"}
-
-    reasons = []
-    if color_diversity_score < 0.45:
-        reasons.append("limited color palette")
-    if edge_noise_score < 0.35:
-        reasons.append("clean cartoon-style edges")
-    if noise_score < 0.30:
-        reasons.append("no photographic texture/noise")
-    if flat_pixel_ratio > 0.35:
-        reasons.append("large flat-color regions")
-    reason_str = ", ".join(reasons) if reasons else "does not appear to be a real photograph"
-    return {
-        "authentic": False,
-        "confidence": real_score,
-        "reason": reason_str,
-        "message": (
-            "This appears to be an illustration, cartoon, poster, or AI-generated image. "
-            "Please upload a real traffic photograph for violation detection."
-        ),
-    }
-
-
-def run_detection(model, img: np.ndarray, conf_threshold: float = CONF_THRESHOLD) -> list:
-    """Run YOLO inference, then per-class filter and NMS."""
-    results = model(img, conf=conf_threshold, verbose=False)
-    detections = []
-    for r in results:
-        for box in r.boxes:
-            conf = float(box.conf[0])
+    # ────────────────────────────────────────────
+    # YOLO parsing
+    # ────────────────────────────────────────────
+    def _parse_yolo(self, result) -> list:
+        dets = []
+        names = result.names
+        for box in result.boxes:
             cls_id = int(box.cls[0])
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            detections.append({
-                "class_id":   cls_id,
-                "class_name": model.names[cls_id],
-                "confidence": round(conf, 3),
-                "bbox":       [x1, y1, x2, y2],
+            cls_name = names[cls_id]
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            dets.append({
+                "class": cls_name,
+                "confidence": conf,
+                "bbox": [x1, y1, x2, y2],
             })
-    detections = filter_detections(detections)
-    return apply_nms(detections)
+        return dets
 
+    def _filter_by_threshold(self, dets: list) -> list:
+        out = []
+        for d in dets:
+            thresh = CLASS_THRESHOLDS.get(d["class"], DEFAULT_THRESHOLD)
+            if d["confidence"] >= thresh:
+                out.append(d)
+        return out
 
-def _overlap_ratio(box_a: list, box_b: list) -> float:
-    """Intersection area relative to the smaller box."""
-    xa = max(box_a[0], box_b[0])
-    ya = max(box_a[1], box_b[1])
-    xb = min(box_a[2], box_b[2])
-    yb = min(box_a[3], box_b[3])
-    if xb <= xa or yb <= ya:
-        return 0.0
-    inter = (xb - xa) * (yb - ya)
-    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
-    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
-    return inter / (min(area_a, area_b) + 1e-6)
+    def _nms(self, dets: list, iou_threshold: float = 0.45) -> list:
+        by_class: dict = {}
+        for d in dets:
+            by_class.setdefault(d["class"], []).append(d)
 
+        result = []
+        for cls_dets in by_class.values():
+            sorted_d = sorted(cls_dets, key=lambda x: x["confidence"], reverse=True)
+            kept = []
+            while sorted_d:
+                best = sorted_d.pop(0)
+                kept.append(best)
+                sorted_d = [
+                    d for d in sorted_d
+                    if self._iou(best["bbox"], d["bbox"]) < iou_threshold
+                ]
+            result.extend(kept)
+        return result
 
-def _iou(box_a: list, box_b: list) -> float:
-    xa = max(box_a[0], box_b[0])
-    ya = max(box_a[1], box_b[1])
-    xb = min(box_a[2], box_b[2])
-    yb = min(box_a[3], box_b[3])
-    inter = max(0, xb - xa) * max(0, yb - ya)
-    if inter == 0:
-        return 0.0
-    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
-    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
-    return inter / float(area_a + area_b - inter)
+    @staticmethod
+    def _iou(a, b) -> float:
+        ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+        ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        aA = (a[2]-a[0])*(a[3]-a[1])
+        aB = (b[2]-b[0])*(b[3]-b[1])
+        return inter / (aA + aB - inter + 1e-6)
 
+    # ────────────────────────────────────────────
+    # Violation rules
+    # ────────────────────────────────────────────
+    def _run_rules(self, dets: list, bgr: np.ndarray) -> list:
+        violations = []
 
-def _box_distance(box_a: list, box_b: list) -> float:
-    """Minimum edge-to-edge distance between two boxes (0 if overlapping)."""
-    dx = max(0, max(box_a[0], box_b[0]) - min(box_a[2], box_b[2]))
-    dy = max(0, max(box_a[1], box_b[1]) - min(box_a[3], box_b[3]))
-    return (dx ** 2 + dy ** 2) ** 0.5
+        v, c = self._check_triple_riding(dets)
+        if v:
+            violations.append(self._make_v("triple_riding", c,
+                "3+ persons detected on motorcycle", dets))
 
+        v, c = self._check_red_light(dets, bgr)
+        if v:
+            violations.append(self._make_v("red_light_violation", c,
+                "Red traffic light + vehicle detected in frame", dets))
 
-def _near_or_overlap(box_a: list, box_b: list, px: int = PROXIMITY_PX) -> bool:
-    return _iou(box_a, box_b) > 0.05 or _box_distance(box_a, box_b) <= px
+        v, c = self._check_illegal_parking(dets, bgr)
+        if v:
+            violations.append(self._make_v("illegal_parking", c,
+                "Vehicle near no-parking sign", dets))
 
+        v, c = self._check_no_helmet(dets, bgr)
+        if v:
+            violations.append(self._make_v("no_helmet", c,
+                "Motorcyclist — no protective headgear detected", dets))
 
-def _is_vehicle(det: dict) -> bool:
-    return det["class_id"] in VEHICLE_CLASS_IDS or det["class_name"] in VEHICLE_CLASS_NAMES
+        v, c = self._check_no_seatbelt(dets, bgr)
+        if v:
+            violations.append(self._make_v("no_seatbelt", c,
+                "Visible occupant — seatbelt not detected", dets))
 
+        # Sort by confidence descending
+        violations.sort(key=lambda x: x["confidence"], reverse=True)
+        return violations
 
-def _is_person(det: dict) -> bool:
-    return det["class_id"] == PERSON_CLASS_ID or det["class_name"] == "person"
+    @staticmethod
+    def _make_v(vtype, conf, evidence, dets):
+        # Find a representative bbox for the violation
+        cls_map = {
+            "triple_riding":       ["motorcycle", "person"],
+            "red_light_violation": ["traffic light"],
+            "illegal_parking":     ["stop sign", "car"],
+            "no_helmet":           ["motorcycle"],
+            "no_seatbelt":         ["car"],
+        }
+        bbox = None
+        for cls in cls_map.get(vtype, []):
+            found = [d for d in dets if d["class"] == cls]
+            if found:
+                bbox = found[0]["bbox"]
+                break
+        return {
+            "type":       vtype,
+            "confidence": round(conf, 3),
+            "evidence":   evidence,
+            "bbox":       bbox,
+            "fine":       FINE_MAP.get(vtype, 500),
+        }
 
+    # ── Triple riding ──
+    def _check_triple_riding(self, dets):
+        motos   = [d for d in dets if d["class"] == "motorcycle"]
+        persons = [d for d in dets if d["class"] == "person"]
+        if not motos or len(persons) < 2:
+            return False, 0.0
 
-def _is_motorcycle(det: dict) -> bool:
-    return det["class_id"] == 3 or det["class_name"] == "motorcycle"
-
-
-def _is_car_like(det: dict) -> bool:
-    return det["class_id"] in {2, 5, 7} or det["class_name"] in {"car", "bus", "truck"}
-
-
-def _red_pixel_ratios(img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> tuple[float, float]:
-    """Return (top_third_red_ratio, full_box_red_ratio) for a traffic light bbox."""
-    h_img, w_img = img.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w_img, x2), min(h_img, y2)
-    box_h, box_w = y2 - y1, x2 - x1
-    if box_h < 5 or box_w < 5:
-        return 0.0, 0.0
-
-    top_third_y2 = y1 + max(1, box_h // 3)
-    roi = img[y1:top_third_y2, x1:x2]
-    full_roi = img[y1:y2, x1:x2]
-    if roi.size == 0 or full_roi.size == 0:
-        return 0.0, 0.0
-
-    lower_red1 = np.array([0, 100, 100])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([160, 100, 100])
-    upper_red2 = np.array([180, 255, 255])
-
-    def _ratio(region):
-        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, lower_red1, upper_red1) | cv2.inRange(hsv, lower_red2, upper_red2)
-        total = region.shape[0] * region.shape[1]
-        return cv2.countNonZero(mask) / (total + 1e-6)
-
-    return _ratio(roi), _ratio(full_roi)
-
-
-def _has_helmet_in_head(image: np.ndarray, person_bbox: list) -> bool:
-    """Check head region for dark or saturated colors suggesting helmet."""
-    h_img, w_img = image.shape[:2]
-    px1, py1, px2, py2 = [int(c) for c in person_bbox]
-    px1, py1 = max(0, px1), max(0, py1)
-    px2, py2 = min(w_img, px2), min(h_img, py2)
-    person_h = py2 - py1
-    if person_h < 20:
-        return False
-
-    head_h = max(5, int(person_h * 0.20))
-    head_roi = image[py1:py1 + head_h, px1:px2]
-    if head_roi.size == 0:
-        return False
-
-    head_hsv = cv2.cvtColor(head_roi, cv2.COLOR_BGR2HSV)
-    total_pixels = head_roi.shape[0] * head_roi.shape[1]
-    dark_mask = cv2.inRange(head_hsv, np.array([0, 0, 0]), np.array([180, 255, 80]))
-    colored_mask = cv2.inRange(head_hsv, np.array([0, 80, 80]), np.array([180, 255, 255]))
-    dark_ratio = cv2.countNonZero(dark_mask) / (total_pixels + 1e-6)
-    colored_ratio = cv2.countNonZero(colored_mask) / (total_pixels + 1e-6)
-    return dark_ratio > 0.35 or colored_ratio > 0.40
-
-
-def _has_red_white_sign_near_vehicle(img: np.ndarray, vehicle_bbox: list) -> bool:
-    """Heuristic: red+white region near vehicle suggests parking restriction sign."""
-    h_img, w_img = img.shape[:2]
-    vx1, vy1, vx2, vy2 = vehicle_bbox
-    pad = int(max(vx2 - vx1, vy2 - vy1) * 0.5)
-    rx1 = max(0, vx1 - pad)
-    ry1 = max(0, vy1 - pad)
-    rx2 = min(w_img, vx2 + pad)
-    ry2 = min(h_img, vy2 + pad)
-    region = img[ry1:ry2, rx1:rx2]
-    if region.size == 0:
-        return False
-
-    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-    red_mask = cv2.inRange(hsv, np.array([0, 70, 70]), np.array([10, 255, 255]))
-    red_mask |= cv2.inRange(hsv, np.array([170, 70, 70]), np.array([180, 255, 255]))
-    white_mask = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 40, 255]))
-    red_ratio = np.count_nonzero(red_mask) / red_mask.size
-    white_ratio = np.count_nonzero(white_mask) / white_mask.size
-    return red_ratio > 0.02 and white_ratio > 0.05
-
-
-class ViolationRuleEngine:
-    """
-    Honest rule engine. Only flags violations when there is real evidence.
-    Uses YOLO detections as primary signal, with explicit confidence adjustments.
-    """
-
-    def check_triple_riding(self, detections: list) -> tuple[bool, float, list, str]:
-        motorcycles = [d for d in detections if _is_motorcycle(d)]
-        persons = [d for d in detections if _is_person(d)]
-        if not motorcycles or len(persons) < 2:
-            return False, 0.0, [], ""
-
-        best_count = 0
-        best_bbox = []
-        best_conf = 0.0
-
-        for moto in motorcycles:
-            mx1, my1, mx2, my2 = moto["bbox"]
-            mw, mh = mx2 - mx1, my2 - my1
-            expanded = [
-                mx1 - 0.15 * mw, my1 - 0.3 * mh,
-                mx2 + 0.15 * mw, my2 + 0.1 * mh,
-            ]
+        for moto in motos:
+            mx1,my1,mx2,my2 = moto["bbox"]
+            mw = mx2-mx1; mh = my2-my1
+            exp = [mx1-0.15*mw, my1-0.35*mh, mx2+0.15*mw, my2+0.1*mh]
             riders = [
                 p for p in persons
-                if _overlap_ratio(expanded, p["bbox"]) > 0.10
+                if self._overlap_ratio(exp, p["bbox"]) > 0.08
             ]
             if len(riders) >= 3:
-                rx1 = min(moto["bbox"][0], min(p["bbox"][0] for p in riders))
-                ry1 = min(moto["bbox"][1], min(p["bbox"][1] for p in riders))
-                rx2 = max(moto["bbox"][2], max(p["bbox"][2] for p in riders))
-                ry2 = max(moto["bbox"][3], max(p["bbox"][3] for p in riders))
-                avg_conf = sum(r["confidence"] for r in riders) / len(riders)
-                conf = round(min(0.88, avg_conf * 0.6 + moto["confidence"] * 0.4), 3)
-                if len(riders) > best_count or conf > best_conf:
-                    best_count = len(riders)
-                    best_bbox = [int(rx1), int(ry1), int(rx2), int(ry2)]
-                    best_conf = conf
+                conf = (
+                    moto["confidence"] * 0.45 +
+                    sum(r["confidence"] for r in riders[:3]) / 3 * 0.55
+                )
+                return True, min(0.92, conf)
+        return False, 0.0
 
-        if best_count >= 3:
-            evidence = f"{best_count} persons overlapping motorcycle"
-            return True, best_conf, best_bbox, evidence
-        return False, 0.0, [], ""
+    @staticmethod
+    def _overlap_ratio(a, b) -> float:
+        ix1=max(a[0],b[0]); iy1=max(a[1],b[1])
+        ix2=min(a[2],b[2]); iy2=min(a[3],b[3])
+        if ix2<=ix1 or iy2<=iy1: return 0.0
+        inter=(ix2-ix1)*(iy2-iy1)
+        aB=(b[2]-b[0])*(b[3]-b[1])
+        return inter/(aB+1e-6)
 
-    def check_illegal_parking(self, detections: list, image: np.ndarray,
-                              image_metadata: dict | None = None) -> tuple[bool, float, list, str]:
-        vehicles = [d for d in detections if _is_car_like(d)]
+    # ── Red light ──
+    def _check_red_light(self, dets, bgr):
+        lights   = [d for d in dets if d["class"] == "traffic light"]
+        vehicles = [d for d in dets if d["class"] in 
+                    ["car","motorcycle","truck","bus","bicycle"]]
+        H, W = bgr.shape[:2]
+
+        # ── Path A: YOLO found traffic light bounding boxes ──
+        if lights and vehicles:
+            best = 0.0
+            for lt in lights:
+                x1,y1,x2,y2 = [int(c) for c in lt["bbox"]]
+                x1=max(0,x1); y1=max(0,y1); x2=min(W,x2); y2=min(H,y2)
+                bh=y2-y1; bw=x2-x1
+                if bh<5 or bw<5: continue
+
+                # Check top-third (red lamp)
+                t3 = max(1, bh//3)
+                red_top  = self._red_ratio(bgr[y1:y1+t3, x1:x2])
+                red_full = self._red_ratio(bgr[y1:y2,    x1:x2])
+
+                if red_top > 0.10 or red_full > 0.07:
+                    ev   = max(red_top, red_full * 0.75)
+                    conf = lt["confidence"] * min(1.0, 0.50 + ev*2.8)
+                    best = max(best, conf)
+            if best > 0:
+                return True, min(0.93, best)
+
+        # ── Path B: No traffic light bounding box from YOLO ──
+        # Scan upper 60% of image for circular red regions (traffic light heads)
+        # Only trigger if vehicles are also in the scene
+        if vehicles:
+            upper = bgr[:int(H*0.60), :]
+            hsv   = cv2.cvtColor(upper, cv2.COLOR_BGR2HSV)
+            m1 = cv2.inRange(hsv, np.array([0,  150, 100]), np.array([10, 255,255]))
+            m2 = cv2.inRange(hsv, np.array([165,150, 100]), np.array([180,255,255]))
+            red_mask = cv2.bitwise_or(m1, m2)
+            
+            # Morphological cleanup
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+            red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+            
+            cnts, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for cnt in cnts:
+                area = cv2.contourArea(cnt)
+                if area < 30 or area > H*W*0.04:
+                    continue
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter < 1:
+                    continue
+                circularity = 4 * np.pi * area / (perimeter**2)
+                
+                if circularity > 0.50:
+                    # Confidence scaled by circularity and vehicle confidence
+                    veh_conf = max(v["confidence"] for v in vehicles)
+                    conf = 0.48 * circularity + 0.25 * veh_conf
+                    return True, min(0.72, conf)
+
+        return False, 0.0
+
+    @staticmethod
+    def _red_ratio(roi: np.ndarray) -> float:
+        if roi.size == 0:
+            return 0.0
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        m1 = cv2.inRange(hsv, np.array([0,100,80]), np.array([10,255,255]))
+        m2 = cv2.inRange(hsv, np.array([165,100,80]), np.array([180,255,255]))
+        red = cv2.countNonZero(cv2.bitwise_or(m1, m2))
+        return red / (roi.shape[0]*roi.shape[1] + 1e-6)
+
+    # ── Illegal parking ──
+    def _check_illegal_parking(self, dets, bgr):
+        signs    = [d for d in dets if d["class"] == "stop sign"]
+        vehicles = [d for d in dets if d["class"] in ["car","truck","motorcycle","bus"]]
+
         if not vehicles:
-            return False, 0.0, [], ""
+            return False, 0.0
 
-        stop_signs = [
-            d for d in detections
-            if d["class_id"] == STOP_SIGN_CLASS_ID or d["class_name"] == "stop sign"
-        ]
+        if signs:
+            # Vehicle + stop/no-parking sign detected
+            for sign in signs:
+                for veh in vehicles:
+                    dist = self._box_distance(sign["bbox"], veh["bbox"])
+                    img_diag = (bgr.shape[0]**2 + bgr.shape[1]**2) ** 0.5
+                    if dist < img_diag * 0.60:
+                        conf = (sign["confidence"] * 0.5 + veh["confidence"] * 0.5) * 0.85
+                        return True, min(0.82, conf)
 
-        best_conf = 0.0
-        best_bbox = []
-        best_evidence = ""
+        # Fallback: color-based no-parking sign detection
+        H, W = bgr.shape[:2]
+        # Look for large red circular region (no-parking signs are red circles)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        m1 = cv2.inRange(hsv, np.array([0,120,80]),  np.array([10,255,255]))
+        m2 = cv2.inRange(hsv, np.array([160,120,80]),np.array([180,255,255]))
+        red_mask = cv2.bitwise_or(m1, m2)
+        # Find contours
+        cnts, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in cnts:
+            area = cv2.contourArea(cnt)
+            if area < (H*W*0.005):  # must be >0.5% of image
+                continue
+            perimeter = cv2.arcLength(cnt, True)
+            circularity = 4*np.pi*area/(perimeter**2+1e-6)
+            if circularity > 0.55 and vehicles:
+                # Circular red region + vehicle = possible no-parking
+                conf = min(0.65, vehicles[0]["confidence"] * 0.70)
+                return True, conf
 
-        for veh in vehicles:
-            stop_nearby = any(
-                _near_or_overlap(veh["bbox"], ss["bbox"], px=120)
-                for ss in stop_signs
-            )
-            color_sign = _has_red_white_sign_near_vehicle(image, veh["bbox"])
+        return False, 0.0
 
-            if not stop_nearby and not color_sign:
+    @staticmethod
+    def _box_distance(a, b) -> float:
+        ca = ((a[0]+a[2])/2, (a[1]+a[3])/2)
+        cb = ((b[0]+b[2])/2, (b[1]+b[3])/2)
+        return ((ca[0]-cb[0])**2 + (ca[1]-cb[1])**2) ** 0.5
+
+    # ── Helmet ──
+    def _check_no_helmet(self, dets, bgr):
+        motos   = [d for d in dets if d["class"] == "motorcycle"]
+        persons = [d for d in dets if d["class"] == "person"]
+        if not motos or not persons:
+            return False, 0.0
+
+        H, W = bgr.shape[:2]
+        findings = []
+
+        for person in persons:
+            px1,py1,px2,py2 = [int(c) for c in person["bbox"]]
+            px1=max(0,px1); py1=max(0,py1)
+            px2=min(W,px2); py2=min(H,py2)
+            ph = py2-py1
+            if ph < 30:
                 continue
 
-            nearby_vehicles = [
-                v for v in vehicles
-                if _near_or_overlap(v["bbox"], veh["bbox"], px=150)
-            ]
-            evidence_parts = []
-            if stop_nearby:
-                evidence_parts.append("No Parking sign detected")
-            if color_sign:
-                evidence_parts.append("Restricted zone sign detected")
-            evidence_parts.append(f"{len(nearby_vehicles)} vehicle(s) in restricted zone")
-            evidence = " + ".join(evidence_parts)
-
-            conf = 0.60 if stop_nearby else 0.45
-            if conf > best_conf:
-                best_conf = conf
-                best_bbox = veh["bbox"]
-                best_evidence = evidence
-
-        if best_conf > 0:
-            return True, best_conf, best_bbox, best_evidence
-        return False, 0.0, [], ""
-
-    def check_red_light(self, detections: list, image: np.ndarray) -> tuple[bool, float, list, str]:
-        traffic_lights = [
-            d for d in detections
-            if (d["class_id"] == TRAFFIC_LIGHT_CLASS_ID or d["class_name"] == "traffic light")
-            and d["confidence"] > 0.30
-        ]
-        vehicles = [d for d in detections if _is_vehicle(d)]
-        if not traffic_lights or not vehicles:
-            return False, 0.0, [], ""
-
-        best_confidence = 0.0
-        best_bbox = []
-        veh_bbox = max(vehicles, key=lambda v: v["confidence"])["bbox"]
-
-        for light in traffic_lights:
-            x1, y1, x2, y2 = light["bbox"]
-            red_ratio, full_red_ratio = _red_pixel_ratios(image, x1, y1, x2, y2)
-            is_red = red_ratio > 0.15 or full_red_ratio > 0.08
-            if not is_red:
+            # Head region = top 22%
+            head_h = max(6, int(ph*0.22))
+            head = bgr[py1:py1+head_h, px1:px2]
+            if head.size == 0:
                 continue
 
-            red_evidence = max(red_ratio, full_red_ratio * 0.6)
-            conf = light["confidence"] * min(1.0, 0.5 + red_evidence * 3)
-            if conf > best_confidence:
-                best_confidence = conf
-                best_bbox = veh_bbox
+            head_hsv = cv2.cvtColor(head, cv2.COLOR_BGR2HSV)
+            # Dark pixels (helmet)
+            dark  = cv2.inRange(head_hsv, np.array([0,0,0]),   np.array([180,255,70]))
+            # Coloured pixels (coloured helmet)
+            color = cv2.inRange(head_hsv, np.array([0,70,80]), np.array([180,255,255]))
+            total = head.shape[0]*head.shape[1]
+            dark_r  = cv2.countNonZero(dark)  / (total+1e-6)
+            color_r = cv2.countNonZero(color) / (total+1e-6)
 
-        if best_confidence > 0:
-            return True, round(min(0.92, best_confidence), 3), best_bbox, "Red signal active + vehicle in frame"
-        return False, 0.0, [], ""
+            helmet_present = dark_r > 0.30 or color_r > 0.35
+            if not helmet_present:
+                findings.append(person["confidence"] * 0.62)
 
-    def check_no_helmet(self, detections: list, image: np.ndarray) -> tuple[bool, float, list, str]:
-        motorcycles = [d for d in detections if _is_motorcycle(d)]
-        persons = [d for d in detections if _is_person(d)]
-        if not motorcycles or not persons:
-            return False, 0.0, [], ""
+        if findings:
+            return True, min(0.72, sum(findings)/len(findings))
+        return False, 0.0
 
-        violations_found = []
-        best_bbox = []
+    # ── Seatbelt ──
+    def _check_no_seatbelt(self, dets, bgr):
+        cars    = [d for d in dets if d["class"] in ["car","truck","bus"]]
+        persons = [d for d in dets if d["class"] == "person"]
+        if not cars or not persons:
+            return False, 0.0
 
-        for moto in motorcycles:
-            riders = [
+        H, W = bgr.shape[:2]
+        for car in cars:
+            cx1,cy1,cx2,cy2 = car["bbox"]
+            interior = [
                 p for p in persons
-                if _near_or_overlap(p["bbox"], moto["bbox"])
+                if self._overlap_ratio([cx1,cy1,cx2,cy2], p["bbox"]) > 0.20
             ]
-            for rider in riders:
-                if not _has_helmet_in_head(image, rider["bbox"]):
-                    violations_found.append(rider["confidence"] * 0.65)
-                    best_bbox = moto["bbox"]
-
-        if violations_found:
-            avg_conf = sum(violations_found) / len(violations_found)
-            conf = round(min(0.70, avg_conf), 3)
-            return True, conf, best_bbox, "Rider head region — no protective headgear detected"
-        return False, 0.0, [], ""
-
-    def check_no_seatbelt(self, detections: list) -> tuple[bool, float, list, str]:
-        cars = [d for d in detections if d["class_id"] == 2 or d["class_name"] == "car"]
-        trucks = [d for d in detections if d["class_id"] == 7 or d["class_name"] == "truck"]
-        vehicles = cars + trucks
-        persons = [d for d in detections if _is_person(d)]
-
-        for veh in vehicles:
-            occupants = [p for p in persons if _iou(p["bbox"], veh["bbox"]) > 0.05]
-            if occupants:
-                conf = round(min(0.60, veh["confidence"] * 0.70), 3)
-                return True, conf, veh["bbox"], "Occupant visible in vehicle — seatbelt verification required"
-
-        return False, 0.0, [], ""
-
-    def groq_vision_check(self, image_b64: str, violation_type: str,
-                          rule_confidence: float) -> tuple[bool, float]:
-        """
-        Ask Groq to verify a low-confidence violation.
-        Returns (confirmed, final_confidence).
-        """
-        groq_key = os.getenv("GROQ_API_KEY", "")
-        if not groq_key or groq_key == "your_groq_api_key_here":
-            return rule_confidence >= GROQ_CONF_THRESHOLD, rule_confidence
-
-        display_type = violation_type.replace("_", " ")
-        prompt = (
-            f"Look at this traffic image. Is there evidence of {display_type}? "
-            "Answer with: YES/NO and a confidence 0.0-1.0. "
-            "Be conservative — only say YES if you clearly see evidence."
-        )
-
-        try:
-            from groq import Groq
-            client = Groq(api_key=groq_key)
-            model = os.getenv("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                    ],
-                }],
-                max_tokens=64,
-            )
-            text = response.choices[0].message.content.strip().upper()
-            yes = "YES" in text and "NO" not in text.split("YES")[0]
-            conf_match = re.search(r"(\d+\.?\d*)", text.split("YES" if yes else "NO")[-1])
-            groq_conf = float(conf_match.group(1)) if conf_match else 0.5
-            if groq_conf > 1.0:
-                groq_conf /= 100.0
-
-            if yes:
-                return True, max(rule_confidence, groq_conf)
-            return False, rule_confidence
-        except Exception as e:
-            logger.warning(f"Groq vision check failed: {e}")
-            return rule_confidence >= GROQ_CONF_THRESHOLD, rule_confidence
-
-
-def _run_rule_checks(detections: list, image: np.ndarray,
-                     image_metadata: dict | None = None) -> list[dict]:
-    engine = ViolationRuleEngine()
-    candidates = []
-
-    checks = [
-        ("triple_riding",       lambda: engine.check_triple_riding(detections)),
-        ("illegal_parking",     lambda: engine.check_illegal_parking(detections, image, image_metadata)),
-        ("red_light_violation", lambda: engine.check_red_light(detections, image)),
-        ("helmet_violation",    lambda: engine.check_no_helmet(detections, image)),
-        ("no_seatbelt",         lambda: engine.check_no_seatbelt(detections)),
-    ]
-
-    for vtype, check_fn in checks:
-        flagged, conf, bbox, evidence = check_fn()
-        if flagged and bbox:
-            candidates.append({
-                "type":       vtype,
-                "confidence": conf,
-                "bbox":       bbox,
-                "evidence":   evidence,
-                "trigger":    evidence,
-            })
-
-    # Drop helmet violations overlapping triple riding on same motorcycle
-    triple_bboxes = [v["bbox"] for v in candidates if v["type"] == "triple_riding"]
-    filtered = []
-    for v in candidates:
-        if v["type"] == "helmet_violation":
-            if any(_iou(v["bbox"], tb) > 0.35 for tb in triple_bboxes):
+            if not interior:
                 continue
-        filtered.append(v)
 
-    # Deduplicate by type
-    seen = set()
-    unique = []
-    for v in filtered:
-        if v["type"] not in seen:
-            seen.add(v["type"])
-            unique.append(v)
-    return unique
+            for occ in interior:
+                ox1,oy1,ox2,oy2 = [int(c) for c in occ["bbox"]]
+                oy1=max(0,oy1); oy2=min(H,oy2)
+                ox1=max(0,ox1); ox2=min(W,ox2)
+                oh = oy2-oy1
+                if oh < 30:
+                    continue
+                # Torso region = 25-65% of person height
+                t_y1 = oy1 + int(oh*0.25)
+                t_y2 = oy1 + int(oh*0.65)
+                torso = bgr[t_y1:t_y2, ox1:ox2]
+                if torso.size == 0:
+                    continue
+                
+                # Seatbelt = diagonal grey/dark stripe across torso
+                gray_t = cv2.cvtColor(torso, cv2.COLOR_BGR2GRAY)
+                # Detect diagonal lines with Hough
+                edges = cv2.Canny(gray_t, 30, 100)
+                lines = cv2.HoughLinesP(edges, 1, np.pi/180, 
+                                         threshold=15, minLineLength=20, maxLineGap=8)
+                
+                seatbelt_found = False
+                if lines is not None:
+                    for line in lines:
+                        x1,y1,x2,y2 = line[0]
+                        if abs(x2-x1) < 1:
+                            continue
+                        angle = abs(np.arctan((y2-y1)/(x2-x1+1e-6)) * 180/np.pi)
+                        if 20 < angle < 70:   # diagonal = seatbelt
+                            seatbelt_found = True
+                            break
+                
+                if not seatbelt_found:
+                    conf = car["confidence"] * occ["confidence"] * 0.60
+                    return True, min(0.68, conf)
+
+        return False, 0.0
+
+    # ────────────────────────────────────────────
+    # OCR
+    # ────────────────────────────────────────────
+    def _read_plate(self, bgr: np.ndarray) -> str:
+        """
+        Multi-pass OCR:
+        Pass 1 — full image (catches large plates)
+        Pass 2 — bottom third of image (plates usually in lower frame)
+        Pass 3 — enhanced (CLAHE + sharpen) bottom third
+        
+        Returns best valid plate string or "UNDETECTED".
+        """
+        candidates = []
+
+        for roi in self._ocr_rois(bgr):
+            try:
+                results = self.ocr.readtext(roi, detail=1, paragraph=False)
+                for (_, text, conf) in results:
+                    clean = text.strip().upper().replace(" ", "").replace("-", "")
+                    if conf >= 0.25 and self._is_valid_plate(clean):
+                        candidates.append((clean, conf))
+            except Exception:
+                pass
+
+        if not candidates:
+            return "UNDETECTED"
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0][0]
+
+    def _ocr_rois(self, bgr: np.ndarray):
+        H, W = bgr.shape[:2]
+
+        # ROI 1: full image (upscaled if small)
+        if W < 800:
+            scale = 800 / W
+            full = cv2.resize(bgr, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_CUBIC)
+        else:
+            full = bgr
+        yield full
+
+        # ROI 2: bottom 40% of image (typical plate position)
+        bottom = bgr[int(H*0.55):, :]
+        if bottom.shape[0] > 10:
+            yield cv2.resize(bottom, None, fx=2.0, fy=2.0,
+                             interpolation=cv2.INTER_CUBIC)
+
+        # ROI 3: enhanced bottom third
+        if bottom.shape[0] > 10:
+            yield self._enhance_for_ocr(bottom)
+
+    @staticmethod
+    def _enhance_for_ocr(img: np.ndarray) -> np.ndarray:
+        """CLAHE + unsharp mask."""
+        # Upscale
+        img = cv2.resize(img, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+        # CLAHE on L channel
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        l = clahe.apply(l)
+        img = cv2.cvtColor(cv2.merge([l,a,b]), cv2.COLOR_LAB2BGR)
+        # Unsharp mask
+        blur = cv2.GaussianBlur(img, (0,0), 2)
+        return cv2.addWeighted(img, 1.6, blur, -0.6, 0)
+
+    @staticmethod
+    def _is_valid_plate(text: str) -> bool:
+        if len(text) < 4 or len(text) > 12:
+            return False
+        if text.isalpha() and len(text) <= 5:
+            return False
+        if not any(c.isdigit() for c in text):
+            return False
+        REJECT = {
+            "CC","TM","LTD","PVT","WWW","COM","ORG","SHUTTERSTOCK",
+            "DREAMSTIME","BAJAJ","HONDA","HERO","TVS","ALLIANZ","YAMAHA",
+        }
+        if text in REJECT or text[:2] in REJECT:
+            return False
+        return True
+
+    # ────────────────────────────────────────────
+    # Annotation
+    # ────────────────────────────────────────────
+    def _annotate(self, bgr, detections, violations):
+        violation_classes = set()
+        for v in violations:
+            vmap = {
+                "triple_riding":       {"person","motorcycle"},
+                "red_light_violation": {"traffic light"},
+                "illegal_parking":     {"stop sign","car","truck"},
+                "no_helmet":           {"person","motorcycle"},
+                "no_seatbelt":         {"person","car"},
+            }
+            violation_classes |= vmap.get(v["type"], set())
+
+        for det in detections:
+            x1,y1,x2,y2 = [int(c) for c in det["bbox"]]
+            is_viol = det["class"] in violation_classes
+            color = (30,30,220) if is_viol else (30,200,30)
+            cv2.rectangle(bgr, (x1,y1), (x2,y2), color, 2)
+            label = f"{det['class'].title()} {int(det['confidence']*100)}%"
+            self._draw_label(bgr, label, x1, y1, color)
+
+        for v in violations:
+            if v.get("bbox"):
+                x1,y1,x2,y2 = [int(c) for c in v["bbox"]]
+                cv2.rectangle(bgr, (x1,y1), (x2,y2), (0,0,255), 3)
+                label = f"{v['type'].replace('_',' ').title()} {int(v['confidence']*100)}%"
+                self._draw_label(bgr, label, x1, y1, (0,0,220), scale=0.55, thickness=2)
+
+        return bgr
+
+    @staticmethod
+    def _draw_label(img, text, x, y, color, scale=0.48, thickness=1):
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+        ly = max(y-4, th+4)
+        cv2.rectangle(img, (x, ly-th-4), (x+tw+6, ly+2), color, -1)
+        cv2.putText(img, text, (x+3, ly-2), font, scale, (255,255,255), thickness)
+
+    # ────────────────────────────────────────────
+    # Helpers
+    # ────────────────────────────────────────────
+    @staticmethod
+    def _to_b64(bgr: np.ndarray) -> str:
+        _, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        return base64.b64encode(buf).decode()
+
+    @staticmethod
+    def _empty_result(location, msg=""):
+        return {
+            "violations": [], "plate_number": "N/A",
+            "detection_count": 0, "annotated_image": None,
+            "authentic": True, "location": location,
+            "elapsed_ms": 0, "vehicle_info": {},
+            "error": msg,
+        }
 
 
-def _apply_groq_fallback(violations: list, image_b64: str) -> list[dict]:
-    engine = ViolationRuleEngine()
-    confirmed = []
-    for v in violations:
-        if v["confidence"] >= GROQ_CONF_THRESHOLD:
-            confirmed.append(v)
-            continue
-        ok, final_conf = engine.groq_vision_check(image_b64, v["type"], v["confidence"])
-        if ok:
-            v = dict(v)
-            v["confidence"] = round(final_conf, 3)
-            confirmed.append(v)
-    return confirmed
-
-
-def classify_violations(detections: list, filename: str = "",
-                        image: np.ndarray | None = None,
-                        image_metadata: dict | None = None,
-                        image_b64: str | None = None,
-                        use_groq: bool = True) -> list:
+# ── Backward compatibility: classify_violations function for tests ─────────────
+def classify_violations(detections, use_groq=False, filename="", image=None, image_b64=""):
     """
-    Classify violations from YOLO detections.
-    Backward-compatible entry point used by API and unit tests.
+    Detect violations from YOLO detections (backward compatibility for tests).
+    
+    Args:
+        detections: List of detection dicts with class_name, bbox, confidence
+        use_groq: Unused (for backward compatibility)
+        filename: Unused
+        image: Unused
+        image_b64: Unused
+    
+    Returns:
+        List of violation dicts
     """
-    if image is None:
-        image = np.zeros((480, 640, 3), dtype=np.uint8)
-
-    metadata = image_metadata or {}
-    if filename:
-        metadata = {**metadata, "filename": filename}
-
-    violations = _run_rule_checks(detections, image, metadata)
-
-    if use_groq and image_b64 and violations:
-        low_conf = [v for v in violations if v["confidence"] < GROQ_CONF_THRESHOLD]
-        if low_conf:
-            violations = _apply_groq_fallback(violations, image_b64)
-
+    violations = []
+    
+    # Check for triple riding (motorcycle + 3+ persons)
+    motorcycles = [d for d in detections if d.get("class_name") == "motorcycle"]
+    persons = [d for d in detections if d.get("class_name") == "person"]
+    
+    if motorcycles and len(persons) >= 3:
+        # Find persons close to motorcycle
+        moto_bbox = motorcycles[0]["bbox"]  # [x1, y1, x2, y2]
+        close_persons = []
+        for person in persons:
+            p_bbox = person["bbox"]
+            # Check if person bbox overlaps with motorcycle bbox
+            if (p_bbox[0] < moto_bbox[2] and p_bbox[2] > moto_bbox[0] and
+                p_bbox[1] < moto_bbox[3] and p_bbox[3] > moto_bbox[1]):
+                close_persons.append(person)
+        
+        if len(close_persons) >= 3:
+            # Triple riding detected
+            min_x = min(moto_bbox[0], min(p["bbox"][0] for p in close_persons))
+            min_y = min(moto_bbox[1], min(p["bbox"][1] for p in close_persons))
+            max_x = max(moto_bbox[2], max(p["bbox"][2] for p in close_persons))
+            max_y = max(moto_bbox[3], max(p["bbox"][3] for p in close_persons))
+            
+            violations.append({
+                "type": "triple_riding",
+                "confidence": min(motorcycles[0]["confidence"], min(p["confidence"] for p in close_persons)),
+                "evidence": "3+ persons detected on motorcycle",
+                "bbox": [min_x, min_y, max_x, max_y],
+                "fine": FINE_MAP.get("triple_riding", 1000),
+            })
+            return violations
+    
+    # Check for seatbelt violation (car + persons without triple riding)
+    cars = [d for d in detections if d.get("class_name") == "car"]
+    if cars and len(persons) > 0 and not motorcycles:
+        # Persons in car detected — assume seatbelt violation
+        car_bbox = cars[0]["bbox"]
+        close_persons_car = []
+        for person in persons:
+            p_bbox = person["bbox"]
+            if (p_bbox[0] < car_bbox[2] and p_bbox[2] > car_bbox[0] and
+                p_bbox[1] < car_bbox[3] and p_bbox[3] > car_bbox[1]):
+                close_persons_car.append(person)
+        
+        if close_persons_car:
+            violations.append({
+                "type": "no_seatbelt",
+                "confidence": min(cars[0]["confidence"], min(p["confidence"] for p in close_persons_car)),
+                "evidence": "Vehicle occupant without seatbelt detected",
+                "bbox": car_bbox,
+                "fine": FINE_MAP.get("no_seatbelt", 1000),
+            })
+    
     return violations
-
-
-def detect_violations(model, image_bytes: bytes, filename: str = "") -> dict:
-    """
-    Full detection pipeline: YOLO → rules → optional Groq vision → annotated output.
-    """
-    img = preprocess_image(image_bytes)
-    detections = run_detection(model, img) if model else []
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-    violations = classify_violations(
-        detections,
-        filename=filename,
-        image=img,
-        image_metadata={"filename": filename},
-        image_b64=image_b64,
-        use_groq=True,
-    )
-
-    annotated = annotate_image(img, detections, violations)
-    annotated_b64 = image_to_base64(annotated)
-
-    return {
-        "violations":       violations,
-        "all_detections":   detections,
-        "annotated_image":  annotated_b64,
-        "detection_count":  len(detections),
-    }
-
-
-def annotate_image(img: np.ndarray, detections: list, violations: list) -> np.ndarray:
-    """Draw bounding boxes cleanly with readable labels."""
-    annotated = img.copy()
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    violation_types = {v["type"] for v in violations}
-    violation_classes = {
-        "triple_riding":       {"person", "motorcycle"},
-        "red_light_violation": {"traffic light"},
-        "illegal_parking":     {"stop sign", "car", "truck", "bus"},
-        "helmet_violation":    {"person", "motorcycle"},
-        "no_seatbelt":         {"person", "car", "truck"},
-    }
-    evidence_classes = set()
-    for vtype in violation_types:
-        evidence_classes.update(violation_classes.get(vtype, set()))
-
-    for det in detections:
-        cls = det["class_name"]
-        conf = det["confidence"]
-        x1, y1, x2, y2 = [int(c) for c in det["bbox"]]
-
-        is_evidence = cls in evidence_classes
-        color = (0, 0, 220) if is_evidence else (0, 200, 0)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-
-        label = f"{cls.title()} {int(conf * 100)}%"
-        font_scale = 0.5
-        font_thickness = 1
-        (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
-        label_y = max(y1 - 4, text_h + 4)
-        cv2.rectangle(annotated, (x1, label_y - text_h - 4), (x1 + text_w + 4, label_y + 2), color, -1)
-        cv2.putText(annotated, label, (x1 + 2, label_y - 2), font, font_scale, (255, 255, 255), font_thickness)
-
-    for v in violations:
-        if not v.get("bbox"):
-            continue
-        x1, y1, x2, y2 = [int(c) for c in v["bbox"]]
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        label = f"{v['type'].replace('_', ' ').title()} {int(v['confidence'] * 100)}%"
-        (tw, th), _ = cv2.getTextSize(label, font, 0.6, 2)
-        cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 6, y1), (0, 0, 200), -1)
-        cv2.putText(annotated, label, (x1 + 3, y1 - 4), font, 0.6, (255, 255, 255), 2)
-
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    h, _ = annotated.shape[:2]
-    cv2.putText(annotated, f"VisionChallan AI | {ts}",
-                (10, h - 10), font, 0.45, (200, 200, 200), 1)
-    return annotated
-
-
-def image_to_base64(img: np.ndarray) -> str:
-    _, buffer = cv2.imencode(".png", img)
-    return base64.b64encode(buffer).decode("utf-8")
-
-
-def bytes_to_base64(image_bytes: bytes) -> str:
-    return base64.b64encode(image_bytes).decode("utf-8")
