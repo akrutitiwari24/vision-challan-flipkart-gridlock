@@ -23,6 +23,7 @@ API_BASE = st.secrets.get(
     "https://vision-challan-flipkart-gridlock-production.up.railway.app"
 )
 
+
 st.set_page_config(
     page_title="VisionChallan AI",
     page_icon="🚦",
