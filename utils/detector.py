@@ -58,13 +58,13 @@ class ViolationDetector:
             logger.info("YOLOv8n loaded")
         return self._model
 
-    @property
-    def ocr(self):
-        if self._ocr is None:
-            import easyocr
-            self._ocr = easyocr.Reader(["en"], gpu=False, verbose=False)
-            logger.info("EasyOCR loaded")
-        return self._ocr
+    # @property
+    # def ocr(self):
+    #     if self._ocr is None:
+    #         import easyocr
+    #         self._ocr = easyocr.Reader(["en"], gpu=False, verbose=False)
+    #         logger.info("EasyOCR loaded")
+    #     return self._ocr
 
     # ────────────────────────────────────────────
     # Main entry point
@@ -106,8 +106,8 @@ class ViolationDetector:
         # 6. Violation rule engine
         violations = self._run_rules(detections, bgr)
 
-        # 7. OCR — only on original BGR (not annotated)
-        plate = self._read_plate(bgr)
+        # 7. OCR disabled for Railway deployment
+        plate = "UNDETECTED"
 
         # 8. Vehicle inference
         vehicle_info = infer_vehicle(detections)
