@@ -21,16 +21,16 @@ logger = logging.getLogger(__name__)
 
 # ── Per-class confidence thresholds (tuned for traffic scenes) ──
 CLASS_THRESHOLDS = {
-    "traffic light": 0.22,   # undershoots in YOLO — keep lower
-    "stop sign":     0.25,
-    "person":        0.42,
-    "motorcycle":    0.38,
-    "bicycle":       0.38,
-    "car":           0.38,
-    "truck":         0.35,
-    "bus":           0.35,
+    "traffic light": 0.15,
+    "stop sign":     0.15,
+    "person":        0.20,
+    "motorcycle":    0.20,
+    "bicycle":       0.20,
+    "car":           0.20,
+    "truck":         0.20,
+    "bus":           0.20,
 }
-DEFAULT_THRESHOLD = 0.36
+DEFAULT_THRESHOLD = 0.20
 
 # ── Violation fine map ──
 FINE_MAP = {
@@ -257,7 +257,7 @@ class ViolationDetector:
             exp = [mx1-0.15*mw, my1-0.35*mh, mx2+0.15*mw, my2+0.1*mh]
             riders = [
                 p for p in persons
-                if self._overlap_ratio(exp, p["bbox"]) > 0.08
+                if self._overlap_ratio(exp, p["bbox"]) > 0.04
             ]
             if len(riders) >= 3:
                 conf = (
@@ -426,7 +426,7 @@ class ViolationDetector:
             dark_r  = cv2.countNonZero(dark)  / (total+1e-6)
             color_r = cv2.countNonZero(color) / (total+1e-6)
 
-            helmet_present = dark_r > 0.30 or color_r > 0.35
+            helmet_present = dark_r > 0.22 or color_r > 0.25
             if not helmet_present:
                 findings.append(person["confidence"] * 0.62)
 
