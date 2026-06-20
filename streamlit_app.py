@@ -18,12 +18,7 @@ from datetime import datetime
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-API_BASE = st.secrets.get(
-    "API_BASE_URL",
-    "https://vision-challan-flipkart-gridlock-production.up.railway.app"
-)
-
-st.write("API_BASE =", API_BASE)
+API_BASE = st.secrets.get("API_BASE_URL")
 
 
 st.set_page_config(
