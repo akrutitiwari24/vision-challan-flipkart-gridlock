@@ -7,10 +7,6 @@ import time
 import base64
 import logging
 import numpy as np
-import pkg_resources
-for pkg in pkg_resources.working_set:
-    if "opencv" in pkg.project_name.lower():
-        print("OPENCV PACKAGE:", pkg.project_name, pkg.version)
 import cv2
 from PIL import Image
 
@@ -106,8 +102,12 @@ class ViolationDetector:
         # 6. Violation rule engine
         violations = self._run_rules(detections, bgr)
 
-        # 7. OCR disabled for Railway deployment
-        plate = "UNDETECTED"
+        # 7. OCR pipeline
+        from utils.ocr import read_plate
+        # Find motorcycle or car bbox to crop the plate
+        veh_bboxes = [d["bbox"] for d in detections if d["class"] in ["car", "motorcycle", "truck", "bus"]]
+        plate_info = read_plate(bgr, bbox=veh_bboxes[0] if veh_bboxes else None)
+        plate = plate_info.get("plate_number", "UNDETECTED")
 
         # 8. Vehicle inference
         vehicle_info = infer_vehicle(detections)

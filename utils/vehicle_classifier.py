@@ -88,7 +88,7 @@ def infer_vehicle(detections: list) -> dict:
     make_model, category, year, icon = pool[bbox_hash % len(pool)]
 
     return {
-        "make_model": f"{year} {make_model}",
+        "make_model": category,
         "category":   category,
         "icon":       icon,
         "yolo_class": best_class,

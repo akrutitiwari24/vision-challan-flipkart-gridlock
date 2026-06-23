@@ -412,30 +412,38 @@ def generate_challan_pdf(
     story.append(Spacer(1, 3*mm))
 
     # ── 6. EVIDENCE IMAGE + QR CODE ───────────────────────────────────────────
-    if evidence_b64:
-        story.append(_bilingual_heading("Photographic Evidence / फोटोग्राफिक साक्ष्य", sHead))
-        story.append(HRFlowable(width=W, thickness=0.5, color=BORDER))
-        story.append(Spacer(1, 2*mm))
-        try:
-            ev_img = _base64_to_rl_image(evidence_b64, W * 0.72, 55*mm)
+    # ── 6. EVIDENCE IMAGE + QR CODE ───────────────────────────────────────────
+    story.append(_bilingual_heading("Photographic Evidence & Verification / फोटोग्राफिक साक्ष्य और सत्यापन", sHead))
+    story.append(HRFlowable(width=W, thickness=0.5, color=BORDER))
+    story.append(Spacer(1, 2*mm))
+    try:
+        if "qr_code_b64" in challan_data and challan_data["qr_code_b64"]:
+            qr_img = _base64_to_rl_image(challan_data["qr_code_b64"], 30*mm, 30*mm)
+        else:
             qr_data = (
                 f"ChallanID:{challan_data.get('challan_id', '')}|"
                 f"Plate:{plate}|Violation:{vio_name}|Fine:{fine_amt}"
             )
             qr_buf = _make_qr(qr_data)
             qr_img = RLImage(qr_buf, width=30*mm, height=30*mm)
+
+        if evidence_b64:
+            ev_img = _base64_to_rl_image(evidence_b64, W * 0.72, 55*mm)
             ev_table = Table([[ev_img, qr_img]], colWidths=[W * 0.75, W * 0.25])
-            ev_table.setStyle(TableStyle([
-                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-                ("ALIGN",         (1, 0), (1, 0), "CENTER"),
-                ("BOX",           (0, 0), (-1, -1), 0.5, BORDER),
-                ("TOPPADDING",    (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ]))
-            story.append(ev_table)
-            story.append(Paragraph("Scan QR to verify challan online", sSmall))
-        except Exception as e:
-            logger.warning(f"Could not embed evidence image: {e}")
+        else:
+            ev_table = Table([[Paragraph("No photographic evidence provided.", sBody), qr_img]], colWidths=[W * 0.75, W * 0.25])
+
+        ev_table.setStyle(TableStyle([
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN",         (1, 0), (1, 0), "CENTER"),
+            ("BOX",           (0, 0), (-1, -1), 0.5, BORDER),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(ev_table)
+        story.append(Paragraph("Scan QR to verify challan online", sSmall))
+    except Exception as e:
+        logger.warning(f"Could not embed evidence or QR: {e}")
         story.append(Spacer(1, 3*mm))
 
     # ── 7. ACTION REQUIRED ────────────────────────────────────────────────────

@@ -22,12 +22,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI()
-
-@app.get("/")
-def home():
-    return {"status": "VisionChallan API is running"}
-
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,6 +32,10 @@ app = FastAPI(
     description="Automated Traffic Violation Detection & Bilingual Challan Generation",
     version="1.0.0",
 )
+
+@app.get("/")
+def home():
+    return {"status": "VisionChallan API is running"}
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,15 +57,15 @@ if not fonts_ok:
     print("WARNING: NotoSansDevanagari font not found. Hindi will not render in PDFs.")
     print(f"Expected at: {DEVANAGARI_FONT_PATH}")
 
-# ── Lazy-load YOLO (avoids OOM on startup) ─────────────────────────────────────
-_model = None
+# ── Lazy-load YOLO detector (avoids OOM on startup) ───────────────────────────
+_detector = None
 
-def get_model():
-    global _model
-    if _model is None:
-        from utils.detector import load_model
-        _model = load_model()
-    return _model
+def get_detector():
+    global _detector
+    if _detector is None:
+        from utils.detector import ViolationDetector
+        _detector = ViolationDetector()
+    return _detector
 
 # ── SQLite violation log (persists across API restarts) ───────────────────────
 DB_PATH = os.getenv("VIOLATIONS_DB_PATH", "violations.db")
@@ -155,7 +153,6 @@ def on_startup():
 
 init_db()
 
-# ── Schemas ────────────────────────────────────────────────────────────────────
 class ChallanRequest(BaseModel):
     plate_number:   str
     violation_type: str
@@ -169,6 +166,8 @@ class ChallanRequest(BaseModel):
     explanation_hi: Optional[str] = None
     enforcement_priority: Optional[str] = None
     vehicle_info:   Optional[dict] = None
+    challan_id:     Optional[str] = None
+    qr_code_b64:    Optional[str] = None
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
@@ -273,7 +272,38 @@ async def generate_challan(req: ChallanRequest):
             confidence     = req.confidence,
             location       = req.location,
             timestamp      = req.timestamp,
+            challan_id     = req.challan_id,
         )
+
+        challan_id = challan_data.get("challan_id", "UNKNOWN")
+        challan_data["challan_number"] = challan_id
+
+        # Generate real QR code once and reuse it
+        if req.qr_code_b64:
+            challan_data["qr_code_b64"] = req.qr_code_b64
+        else:
+            import qrcode
+            import json
+            import io
+            
+            qr_payload = {
+                "challan_number": challan_id,
+                "vehicle_number": req.plate_number,
+                "violation": req.violation_type,
+                "fine_amount": int(challan_data.get("fine_amount_inr", 0)),
+                "date_time": req.timestamp or datetime.datetime.now().strftime('%d %b %Y %H:%M'),
+                "location": req.location
+            }
+            
+            qr_json = json.dumps(qr_payload)
+            qr = qrcode.QRCode(version=1, box_size=4, border=2)
+            qr.add_data(qr_json)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white")
+            qr_io = io.BytesIO()
+            qr_img.save(qr_io, format="PNG")
+            qr_b64 = base64.b64encode(qr_io.getvalue()).decode("utf-8")
+            challan_data["qr_code_b64"] = qr_b64
 
         # Add vehicle info if provided
         if req.vehicle_info:
@@ -320,7 +350,7 @@ async def generate_challan(req: ChallanRequest):
         return JSONResponse({
             "success":       True,
             "challan": {
-                "challan_number": challan_data.get("challan_number", "UNKNOWN"),
+                "challan_number": challan_id,
                 "plate_number":  req.plate_number,
                 "violation_type": req.violation_type,
                 "fine_amount":   challan_data.get("fine_amount_inr", mv_info["fine_inr"]),
@@ -333,7 +363,7 @@ async def generate_challan(req: ChallanRequest):
                 "qr_code":       challan_data.get("qr_code_b64", ""),
             },
             "pdf_b64":       pdf_b64,
-            "pdf_filename":  f"challan_{challan_data.get('challan_number','VCA')}.pdf",
+            "pdf_filename":  f"challan_{challan_id}.pdf",
         })
 
     except Exception as e:
@@ -354,7 +384,37 @@ async def challan_pdf(req: ChallanRequest):
             confidence=req.confidence,
             location=req.location,
             timestamp=req.timestamp,
+            challan_id=req.challan_id,
         )
+
+        challan_id = challan_data.get("challan_id", "UNKNOWN")
+        challan_data["challan_number"] = challan_id
+
+        if req.qr_code_b64:
+            challan_data["qr_code_b64"] = req.qr_code_b64
+        else:
+            import qrcode
+            import json
+            import io
+            
+            qr_payload = {
+                "challan_number": challan_id,
+                "vehicle_number": req.plate_number,
+                "violation": req.violation_type,
+                "fine_amount": int(challan_data.get("fine_amount_inr", 0)),
+                "date_time": req.timestamp or datetime.datetime.now().strftime('%d %b %Y %H:%M'),
+                "location": req.location
+            }
+            
+            qr_json = json.dumps(qr_payload)
+            qr = qrcode.QRCode(version=1, box_size=4, border=2)
+            qr.add_data(qr_json)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white")
+            qr_io = io.BytesIO()
+            qr_img.save(qr_io, format="PNG")
+            qr_b64 = base64.b64encode(qr_io.getvalue()).decode("utf-8")
+            challan_data["qr_code_b64"] = qr_b64
 
         pdf_bytes = generate_challan_pdf(
             challan_data=challan_data,

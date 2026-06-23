@@ -18,7 +18,7 @@ from datetime import datetime
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-API_BASE = st.secrets.get("API_BASE_URL")
+API_BASE = st.secrets.get("API_BASE", st.secrets.get("API_BASE_URL", "http://localhost:8000"))
 
 
 st.set_page_config(
@@ -207,7 +207,7 @@ st.sidebar.markdown(
 
 st.sidebar.markdown('<div style="font-size:0.72rem;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.14em;margin-bottom:12px;">Detection Location</div>', unsafe_allow_html=True)
 st.sidebar.text_input(
-    "",
+    "Detection Location",
     value="Bengaluru, Karnataka",
     placeholder="City, State",
     label_visibility="collapsed",
@@ -421,11 +421,16 @@ def render_detection_tab():
                     '</div>'
                     '</div>', unsafe_allow_html=True)
 
+        detected_plate = result.get("plate_number", "UNDETECTED")
+        plate_display = detected_plate
+        if plate_display == "UNDETECTED" or not plate_display:
+            plate_display = "Plate requires verification"
+
         st.markdown('<div class="panel" style="margin-bottom:20px;">'
                     '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">'
                     '<div>'
                     '<div class="label-small">Detected Plate</div>'
-                    f'<div class="value-large">{result.get("plate_number","UNDETECTED")}</div>'
+                    f'<div class="value-large">{plate_display}</div>'
                     '</div>'
                     '<div>'
                     '<div class="label-small">Vehicle</div>'
@@ -434,39 +439,48 @@ def render_detection_tab():
                     '</div>'
                     '</div>', unsafe_allow_html=True)
 
+        default_val = detected_plate if detected_plate not in ["UNDETECTED", "Plate requires verification"] else ""
         override_plate = st.text_input(
             "Override detected plate",
-            value=result.get("plate_number", ""),
+            value=default_val,
             key="manual_plate",
         )
+        st.markdown('<div style="color:#94a3b8;font-size:0.85rem;margin-top:-10px;margin-bottom:10px;">Officer may manually verify and enter vehicle registration number.</div>', unsafe_allow_html=True)
 
         if st.button('Generate Challan', type='primary', use_container_width=True, key='gen_challan_btn'):
-            top_v = violations[0] if violations else {"type": "unknown", "confidence": 0}
-            plate_final = override_plate.strip() or result.get("plate_number", "UNKNOWN") or "UNKNOWN"
-            payload = {
-                'plate_number': plate_final,
-                'violation_type': top_v['type'],
-                'confidence': top_v.get('confidence', 0),
-                'location': st.session_state.location_input,
-                'vehicle_info': result.get('vehicle_info', {}),
-            }
-            with st.spinner('Generating bilingual challan...'):
-                try:
-                    cd, pdf_b = call_challan_api(payload)
-                    st.session_state.challan_result = cd
-                    st.session_state.pdf_bytes = pdf_b
-                    st.session_state.challan_history.append({
-                        'challan_no': cd.get('challan_number','—'),
-                        'violation': top_v['type'].replace('_',' ').title(),
-                        'plate': plate_final,
-                        'fine': cd.get('fine_amount', 0),
-                        'time': datetime.now().strftime('%H:%M:%S'),
-                        'location': st.session_state.location_input,
-                    })
-                    st.session_state.active_tab = 'E-Challan'
-                    st.rerun()
-                except Exception as e:
-                    show_error('Challan generation failed.', str(e))
+            plate_final = override_plate.strip()
+            if not plate_final:
+                if detected_plate and detected_plate not in ["UNDETECTED", "Plate requires verification"]:
+                    plate_final = detected_plate
+
+            if not plate_final:
+                st.error("Vehicle registration number required before issuing challan.")
+            else:
+                top_v = violations[0] if violations else {"type": "unknown", "confidence": 0.5}
+                payload = {
+                    'plate_number': plate_final,
+                    'violation_type': top_v.get('type', 'unknown'),
+                    'confidence': top_v.get('confidence', 0.5),
+                    'location': st.session_state.location_input,
+                    'vehicle_info': result.get('vehicle_info', {}),
+                }
+                with st.spinner('Generating bilingual challan...'):
+                    try:
+                        cd, pdf_b = call_challan_api(payload)
+                        st.session_state.challan_result = cd
+                        st.session_state.pdf_bytes = pdf_b
+                        st.session_state.challan_history.append({
+                            'challan_no': cd.get('challan_number','—'),
+                            'violation': top_v.get('type', 'unknown').replace('_',' ').title(),
+                            'plate': plate_final,
+                            'fine': cd.get('fine_amount', 0),
+                            'time': datetime.now().strftime('%H:%M:%S'),
+                            'location': st.session_state.location_input,
+                        })
+                        st.session_state.active_tab = 'E-Challan'
+                        st.rerun()
+                    except Exception as e:
+                        show_error('Challan generation failed.', str(e))
 
     if st.session_state.detection_result and st.session_state.detection_result.get("violations"):
         object_rows = []
@@ -497,6 +511,12 @@ def render_echallan_tab():
     fine_value = f"₹{int(cd.get('fine_amount', 0)):,}"
     status = cd.get('status', 'Issued')
     issued_at = cd.get('issued_at', datetime.now().strftime('%d %b %Y %H:%M'))
+
+    qr_b64 = cd.get("qr_code", "")
+    if qr_b64:
+        qr_html = f'<img src="data:image/png;base64,{qr_b64}" style="width:96px;height:96px;border-radius:12px;border:none;background:white;padding:4px;display:block;margin:0 auto;" />'
+    else:
+        qr_html = '<div style="width:96px;height:96px;background:rgba(255,255,255,0.06);border-radius:18px;display:flex;align-items:center;justify-content:center;color:#94a3b8;margin:0 auto;">QR</div>'
 
     _, center, _ = st.columns([1, 8, 1])
     with center:
@@ -537,7 +557,7 @@ def render_echallan_tab():
             f'  <div style="padding:18px;background:rgba(255,255,255,0.02);border-radius:14px;display:flex;align-items:center;justify-content:center;">'
             f'    <div style="text-align:center;">'
             f'      <div style="font-size:0.78rem;color:#94a3b8;margin-bottom:8px;">QR Code</div>'
-            f'      <div style="width:96px;height:96px;background:rgba(255,255,255,0.06);border-radius:18px;display:flex;align-items:center;justify-content:center;color:#94a3b8;">QR</div>'
+            f'      {qr_html}'
             f'    </div>'
             f'  </div>'
             '</div>'

@@ -42,11 +42,11 @@ def extract_plate_region(img: np.ndarray, bbox: list = None) -> np.ndarray:
     h, w = img.shape[:2]
 
     if bbox:
-        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = [int(v) for v in bbox]
         # License plate is typically in the lower 40% of the vehicle bbox
         plate_y1 = y1 + int((y2 - y1) * 0.60)
-        region = img[max(0, plate_y1):min(h, y2 + 10),
-                     max(0, x1 - 5):min(w, x2 + 5)]
+        region = img[max(0, int(plate_y1)):min(h, int(y2) + 10),
+                     max(0, int(x1) - 5):min(w, int(x2) + 5)]
     else:
         # Fallback: scan lower third
         region = img[int(h * 0.65):h, :]
@@ -152,122 +152,80 @@ def read_plate(img: np.ndarray, bbox: list = None) -> dict:
     }
 
     try:
+        # 1. ANPR pipeline / Plate region detection
         img_enhanced = preprocess_for_ocr(img)
         plate_region = extract_plate_region(img_enhanced, bbox)
         if plate_region is None or plate_region.size == 0:
             return result
 
         reader = get_ocr_reader()
+        if not reader:
+            return result
 
-        if reader:
-            # Stage 1: Try preprocessed (binarized) crop
-            plate_proc = preprocess_plate(plate_region)
-            ocr_results = reader.readtext(plate_proc)
-            
-            # Stage 2: Try original color cropped region
-            if not ocr_results:
-                ocr_results = reader.readtext(plate_region)
-                
-            # Stage 3: Try scanning the bottom 50% of the entire image
-            if not ocr_results:
-                h, w = img_enhanced.shape[:2]
-                fallback_full_region = img_enhanced[int(h * 0.5):h, :]
-                ocr_results = reader.readtext(fallback_full_region)
+        # Define the 4 passes
+        # Pass 1: Original image crop
+        pass1 = plate_region.copy()
 
-            if ocr_results:
-                candidates = sorted(ocr_results, key=lambda x: -x[2])
-                best_match = None
-                for c in candidates:
-                    raw = c[1].strip().upper()
-                    if c[2] <= 0.3 or not is_valid_plate(raw):
-                        continue
-                    cleaned = clean_plate_text(c[1])
-                    if cleaned != "UNDETECTED" and len(cleaned.replace(" ", "")) >= 7:
-                        best_match = (cleaned, c[2])
-                        break
-                
-                # --- STRATEGY B: If individual boxes don't match standard plate, combine them ---
-                if not best_match:
-                    # Group bounding boxes into lines based on vertical overlap
-                    lines = []
-                    # Sort detections by Y center
-                    sorted_by_y = sorted(
-                        ocr_results, 
-                        key=lambda x: (min(pt[1] for pt in x[0]) + max(pt[1] for pt in x[0])) / 2
-                    )
-                    
-                    current_line = []
-                    for det in sorted_by_y:
-                        bbox_pts, text, conf = det
-                        ymin = min(pt[1] for pt in bbox_pts)
-                        ymax = max(pt[1] for pt in bbox_pts)
-                        ycenter = (ymin + ymax) / 2
-                        height = ymax - ymin
-                        
-                        if not current_line:
-                            current_line.append(det)
-                        else:
-                            line_ymin = min(min(pt[1] for pt in d[0]) for d in current_line)
-                            line_ymax = max(max(pt[1] for pt in d[0]) for d in current_line)
-                            line_ycenter = (line_ymin + line_ymax) / 2
-                            line_height = line_ymax - line_ymin
-                            
-                            if abs(ycenter - line_ycenter) < (max(height, line_height) * 0.6):
-                                current_line.append(det)
-                            else:
-                                lines.append(current_line)
-                                current_line = [det]
-                    if current_line:
-                        lines.append(current_line)
-                    
-                    # Sort each line from left to right and join text
-                    line_texts = []
-                    total_conf = 0
-                    count = 0
-                    for line in lines:
-                        line_sorted = sorted(line, key=lambda x: min(pt[0] for pt in x[0]))
-                        line_text = " ".join(c[1] for c in line_sorted)
-                        line_texts.append(line_text)
-                        total_conf += sum(c[2] for c in line)
-                        count += len(line)
-                    
-                    combined_text = " ".join(line_texts)
-                    avg_conf = total_conf / count if count > 0 else 0.0
-                    
-                    cleaned_combined = clean_plate_text(combined_text)
-                    if cleaned_combined != "UNDETECTED" and is_valid_plate(combined_text):
-                        best_match = (cleaned_combined, avg_conf)
-                
-                # --- STRATEGY C: Ultimate fallback to highest confidence valid candidate ---
-                if not best_match:
-                    for c in candidates:
-                        raw = c[1].strip().upper()
-                        if c[2] > 0.3 and is_valid_plate(raw):
-                            cleaned = clean_plate_text(c[1])
-                            if cleaned != "UNDETECTED":
-                                best_match = (cleaned, c[2])
-                                break
+        # Pass 2: Grayscale image crop
+        pass2 = cv2.cvtColor(plate_region, cv2.COLOR_BGR2GRAY)
+        pass2_3ch = cv2.cvtColor(pass2, cv2.COLOR_GRAY2BGR)
 
-                if best_match:
-                    result.update({
-                        "plate_number": best_match[0],
-                        "confidence":   round(best_match[1], 3),
-                        "method":       "easyocr",
-                    })
+        # Pass 3: Thresholded image crop
+        blur = cv2.GaussianBlur(pass2, (3, 3), 0)
+        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        pass3_3ch = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+
+        # Pass 4: Contrast-enhanced image crop (CLAHE + unsharp mask)
+        h_p, w_p = plate_region.shape[:2]
+        if w_p > 0 and h_p > 0:
+            resized_p = cv2.resize(plate_region, (w_p * 2, h_p * 2), interpolation=cv2.INTER_CUBIC)
+            lab = cv2.cvtColor(resized_p, cv2.COLOR_BGR2LAB)
+            l, a, b_ch = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            enhanced_lab = cv2.merge([l, a, b_ch])
+            enhanced_bgr = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+            blur_p = cv2.GaussianBlur(enhanced_bgr, (0, 0), 2)
+            pass4 = cv2.addWeighted(enhanced_bgr, 1.6, blur_p, -0.6, 0)
         else:
-            # Demo fallback — generate a plausible Indian plate
+            pass4 = pass1.copy()
+
+        # Compile validation regex
+        INDIAN_PLATE_PATTERN = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$")
+
+        candidates = []  # list of (cleaned_text, confidence)
+
+        for pass_img in [pass1, pass2_3ch, pass3_3ch, pass4]:
+            try:
+                ocr_results = reader.readtext(pass_img)
+                if not ocr_results:
+                    continue
+                # 1. Check individual boxes
+                for (_, text, conf) in ocr_results:
+                    # Clean OCR output: Convert to uppercase, remove spaces, remove special characters
+                    cleaned = re.sub(r"[^A-Za-z0-9]", "", text).upper()
+                    if INDIAN_PLATE_PATTERN.match(cleaned):
+                        candidates.append((cleaned, conf))
+                # 2. Check combined boxes
+                sorted_left_to_right = sorted(ocr_results, key=lambda x: min(pt[0] for pt in x[0]))
+                combined_text = "".join(c[1] for c in sorted_left_to_right)
+                cleaned_combined = re.sub(r"[^A-Za-z0-9]", "", combined_text).upper()
+                if INDIAN_PLATE_PATTERN.match(cleaned_combined):
+                    avg_conf = sum(c[2] for c in ocr_results) / len(ocr_results)
+                    candidates.append((cleaned_combined, avg_conf))
+            except Exception as e:
+                logger.warning(f"Error in OCR pass: {e}")
+
+        # Choose the highest confidence valid plate
+        if candidates:
+            candidates.sort(key=lambda x: x[1], reverse=True)
             result.update({
-                "plate_number": "DL 01 AB 1234",
-                "confidence":   0.50,
-                "method":       "demo_fallback",
+                "plate_number": candidates[0][0],
+                "confidence":   round(candidates[0][1], 3),
+                "method":       "easyocr",
             })
 
     except Exception as e:
-        logger.warning(f"OCR error: {e}")
-        result.update({
-            "plate_number": "DL 01 AB 1234",
-            "confidence":   0.50,
-            "method":       "demo_fallback",
-        })
+        logger.warning(f"OCR pipeline error: {e}")
 
     return result

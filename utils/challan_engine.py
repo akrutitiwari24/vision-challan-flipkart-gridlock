@@ -20,16 +20,11 @@ Return ONLY valid JSON. No markdown, no preamble, no explanation. Just the JSON 
 
 
 def generate_challan_number(location: str = "Unknown") -> str:
-    """Generate official-style challan reference with city prefix."""
-    city_codes = {
-        "bengaluru": "BLR", "bangalore": "BLR", "delhi": "DL",
-        "new delhi": "DL", "mumbai": "MUM", "chennai": "CHN",
-        "hyderabad": "HYD", "kolkata": "KOL", "pune": "PUN",
-    }
-    city_key = (location or "Unknown").lower().split(",")[0].strip()
-    prefix = city_codes.get(city_key, "VC")
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"{prefix}-VC-{timestamp}"
+    """Generate unique challan number automatically in ECH-YYYYMMDD-XXXXXX format."""
+    import random
+    date_str = datetime.datetime.now().strftime("%Y%m%d")
+    rand_digits = f"{random.randint(0, 999999):06d}"
+    return f"ECH-{date_str}-{rand_digits}"
 
 
 def _build_challan_prompt(
@@ -75,6 +70,7 @@ def generate_challan_groq(
     confidence: float,
     location: str = "New Delhi, India",
     timestamp: str = None,
+    challan_id: str = None,
 ) -> dict:
     """
     Call Groq API to generate challan JSON.
@@ -84,6 +80,9 @@ def generate_challan_groq(
         timestamp = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
     mv_info = get_violation_info(violation_type)
+
+    if not challan_id:
+        challan_id = generate_challan_number(location)
 
     # Try Groq API
     groq_key = os.getenv("GROQ_API_KEY", "")
@@ -119,7 +118,7 @@ def generate_challan_groq(
 
             challan_data = json.loads(raw)
             challan_data["_source"] = "groq_llm"
-            challan_data["challan_id"] = generate_challan_number(location)
+            challan_data["challan_id"] = challan_id
             return challan_data
 
         except Exception as e:
@@ -127,14 +126,15 @@ def generate_challan_groq(
 
     # Template fallback (no API key or API failed)
     return _template_challan(plate_number, violation_type, confidence,
-                              timestamp, location, mv_info)
+                              timestamp, location, mv_info, challan_id)
 
 
 def _template_challan(
-    plate_number, violation_type, confidence, timestamp, location, mv_info
+    plate_number, violation_type, confidence, timestamp, location, mv_info, challan_id=None
 ) -> dict:
     """High-quality template challan — used when Groq is unavailable."""
-    challan_id = generate_challan_number(location)
+    if not challan_id:
+        challan_id = generate_challan_number(location)
     return {
         "challan_id":               challan_id,
         "vehicle_registration":     plate_number,
